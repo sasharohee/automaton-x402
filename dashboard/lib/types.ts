@@ -65,6 +65,38 @@ export interface Warning {
   text?: Nullable<string>;
 }
 
+export interface EarningItem {
+  t?: Nullable<string>;
+  amountUsd?: Nullable<number>;
+  from?: Nullable<string>;
+}
+
+export interface DepositsInfo {
+  totalUsd?: Nullable<number>;
+  count?: Nullable<number>;
+  items?: Nullable<EarningItem[]>;
+}
+
+/** Gains lus on-chain par le pusher (transferts USDC entrants). Les apports du créateur sont dans `deposits`. */
+export interface EarningsInfo {
+  currency?: Nullable<string>;
+  totalUsd?: Nullable<number>;
+  todayUsd?: Nullable<number>;
+  day?: Nullable<string>;
+  dayIsUtc?: Nullable<boolean>;
+  count?: Nullable<number>;
+  countToday?: Nullable<number>;
+  last?: Nullable<EarningItem>;
+  recent?: Nullable<EarningItem[]>;
+  netTodayUsd?: Nullable<number>;
+  deposits?: Nullable<DepositsInfo>;
+  trackingSince?: Nullable<string>;
+  checkedAt?: Nullable<string>;
+  behindBlocks?: Nullable<number>;
+  error?: Nullable<boolean>;
+  checkEverySec?: Nullable<number>;
+}
+
 export interface Snapshot {
   v: 1;
   kind: "full";
@@ -73,6 +105,7 @@ export interface Snapshot {
   agent?: Nullable<AgentInfo>;
   wallet?: Nullable<WalletInfo>;
   spend?: Nullable<SpendInfo>;
+  earnings?: Nullable<EarningsInfo>;
   balanceHistory?: Nullable<unknown[]>;
   goals?: Nullable<Goal[]>;
   heartbeats?: Nullable<Heartbeat[]>;

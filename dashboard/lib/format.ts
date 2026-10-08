@@ -92,6 +92,15 @@ export function fmtUsd(x: number | null, digits = 2): string {
   return x === null ? "—" : `${fmtNum(x, digits)} $`;
 }
 
+/** Montant avec 2 décimales, ou jusqu'à 4 pour les petits montants (0,0125). */
+export function fmtAmount(x: number | null): string {
+  if (x === null) return "—";
+  const abs = Math.abs(x);
+  const small = abs > 0 && abs < 1 && Math.abs(Math.round(abs * 100) - abs * 100) > 1e-6;
+  if (!small) return fmtNum(x, 2);
+  return new Intl.NumberFormat("fr-FR", { minimumFractionDigits: 2, maximumFractionDigits: 4 }).format(x);
+}
+
 export function shortAddress(x: string | null): string {
   if (!x) return "—";
   return x.length > 14 ? `${x.slice(0, 6)}…${x.slice(-4)}` : x;

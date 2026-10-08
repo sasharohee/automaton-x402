@@ -5,11 +5,12 @@
 // sans lien ni image générés à partir du contenu. Chaque valeur passe par
 // str()/num()/arr()/obj() pour qu'un champ manquant ou mal typé ne plante pas.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import BalanceChart from "./BalanceChart";
 import {
   arr,
   fmtAgo,
+  fmtAmount,
   fmtDateTime,
   fmtDuration,
   fmtNum,
@@ -26,6 +27,9 @@ import type {
   AgentEvent,
   AgentInfo,
   ContainerInfo,
+  DepositsInfo,
+  EarningItem,
+  EarningsInfo,
   Goal,
   Heartbeat,
   SpendInfo,
@@ -85,6 +89,10 @@ const SOURCES: Record<string, string> = {
   blob: "sauvegarde Blob",
   none: "aucune",
 };
+
+function isObject(x: unknown): boolean {
+  return typeof x === "object" && x !== null && !Array.isArray(x);
+}
 
 function safeKind(k: string | null): string {
   return k && Object.hasOwn(EVENT_KINDS, k) ? k : "info";
@@ -153,6 +161,7 @@ export default function Dashboard() {
   const container = obj<ContainerInfo>(agent.container);
   const wallet = obj<WalletInfo>(s.wallet);
   const spend = obj<SpendInfo>(s.spend);
+  const earnings = isObject(s.earnings) ? obj<EarningsInfo>(s.earnings) : null;
   const warnings = arr<Warning>(s.warnings).map((w) => obj<Warning>(w));
   const goals = arr<Goal>(s.goals).map((g) => obj<Goal>(g));
   const heartbeats = arr<Heartbeat>(s.heartbeats).map((h) => obj<Heartbeat>(h));
@@ -224,6 +233,8 @@ export default function Dashboard() {
         </section>
       ) : (
         <>
+          <EarningsCard earnings={earnings} spend={spend} serverNow={serverNow} />
+
           <div className="grid">
             <StatusCard container={container} serverNow={serverNow} />
             <WalletCard wallet={wallet} serverNow={serverNow} />
@@ -300,6 +311,149 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
       <span className="muted">{label}</span>
       <span className="value">{children}</span>
     </div>
+  );
+}
+
+function signed(x: number, unit: string): string {
+  return `${x < 0 ? "−" : "+"}${fmtAmount(Math.abs(x))} ${unit}`;
+}
+
+function EarningsCard({
+  earnings,
+  spend,
+  serverNow,
+}: {
+  earnings: Partial<EarningsInfo> | null;
+  spend: Partial<SpendInfo>;
+  serverNow: number;
+}) {
+  const e = earnings ?? {};
+  const count = num(e.count);
+
+  // Surbrillance passagère quand un nouveau paiement arrive entre deux rafraîchissements.
+  const prevCount = useRef<number | null>(null);
+  const [flash, setFlash] = useState(false);
+  useEffect(() => {
+    if (count === null) return;
+    const prev = prevCount.current;
+    prevCount.current = count;
+    if (prev === null || count <= prev) return;
+    setFlash(true);
+    const t = setTimeout(() => setFlash(false), 2500);
+    return () => clearTimeout(t);
+  }, [count]);
+
+  if (!earnings) {
+    return (
+      <section className="card earnings">
+        <h2>Gains</h2>
+        <p className="muted">Données de gains pas encore disponibles.</p>
+      </section>
+    );
+  }
+
+  const unit = str(e.currency) ?? "USDC";
+  const total = num(e.totalUsd);
+  const today = num(e.todayUsd);
+  const countToday = num(e.countToday);
+  const last = isObject(e.last) ? obj<EarningItem>(e.last) : null;
+  const lastAmount = last ? num(last.amountUsd) : null;
+  const recent = arr<EarningItem>(e.recent)
+    .filter(isObject)
+    .map((r) => obj<EarningItem>(r))
+    .slice(0, 10);
+  const empty = count === 0 || (count === null && lastAmount === null && recent.length === 0);
+
+  const spendToday = num(spend.todayUsd);
+  const net = num(e.netTodayUsd) ?? (today !== null && spendToday !== null ? today - spendToday : null);
+
+  const deposits = isObject(e.deposits) ? obj<DepositsInfo>(e.deposits) : null;
+  const depositItems = deposits ? arr<EarningItem>(deposits.items).filter(isObject).map((d) => obj<EarningItem>(d)) : [];
+  const depositCount = (deposits && num(deposits.count)) ?? depositItems.length;
+  const lastDeposit = depositItems.reduce<number | null>((max, d) => {
+    const t = parseTime(d.t);
+    return t !== null && (max === null || t > max) ? t : max;
+  }, null);
+
+  const behind = num(e.behindBlocks);
+
+  return (
+    <section className={`card earnings${flash ? " flash" : ""}`}>
+      <div className="earn-head">
+        <h2>Gains</h2>
+        <span className="muted small">en temps réel, vérifié toutes les minutes</span>
+      </div>
+      <div className="earn-grid">
+        <div>
+          <p className="big">
+            {fmtAmount(total ?? (empty ? 0 : null))} <span className="unit">{unit}</span>
+          </p>
+          <p className="muted small">total gagné</p>
+        </div>
+        <div>
+          <Row label="Gagné aujourd'hui">
+            {fmtAmount(today ?? (empty ? 0 : null))} {unit}
+          </Row>
+          <Row label="Paiements reçus">
+            {count !== null ? String(count) : "—"}
+            {countToday !== null && ` (dont ${countToday} aujourd'hui)`}
+          </Row>
+          {!empty && (
+            <Row label="Dernier paiement">
+              {lastAmount !== null
+                ? `${signed(lastAmount, unit)} à ${fmtSmart(parseTime(last?.t), serverNow)}`
+                : "—"}
+            </Row>
+          )}
+          <Row label="Résultat net du jour">
+            {net !== null ? <span className={net >= 0 ? "pos" : "neg"}>{signed(net, "$")}</span> : "—"}
+          </Row>
+          <p className="muted small note">
+            {e.dayIsUtc === false ? "jour local" : "jour UTC, comme les dépenses"}
+          </p>
+        </div>
+      </div>
+
+      {empty ? (
+        <p className="earn-empty">Aucun gain pour l&apos;instant.</p>
+      ) : (
+        recent.length > 0 && (
+          <>
+            <h3 className="sub">Derniers paiements</h3>
+            <ul className="list">
+              {recent.map((r, i) => {
+                const amount = num(r.amountUsd);
+                return (
+                  <li key={i}>
+                    <span className="pos">{amount !== null ? signed(amount, unit) : "—"}</span>
+                    <span className="time">{fmtSmart(parseTime(r.t), serverNow)}</span>
+                    <span className="text muted small">
+                      de <code>{shortAddress(str(r.from))}</code>
+                    </span>
+                  </li>
+                );
+              })}
+            </ul>
+          </>
+        )
+      )}
+
+      {deposits && (
+        <p className="muted small deposits">
+          Apports du créateur : {fmtAmount(num(deposits.totalUsd))} {unit} ({depositCount}{" "}
+          {depositCount > 1 ? "versements" : "versement"}), non comptés comme gains
+          {lastDeposit !== null && ` · dernier le ${fmtDateTime(lastDeposit)}`}
+        </p>
+      )}
+
+      <p className="muted small earn-foot">
+        Vérifié {fmtSmart(parseTime(e.checkedAt), serverNow)}
+        {e.error === true && (
+          <span className="warn-text"> · Lecture on-chain des gains momentanément impossible</span>
+        )}
+        {behind !== null && behind > 300 && " · rattrapage en cours"}
+      </p>
+    </section>
   );
 }
 
