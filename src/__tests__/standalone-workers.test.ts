@@ -339,9 +339,23 @@ describe("standalone worker / planner fixes", () => {
   // ─── B: no resurrection of exhausted tasks / failed goals ────
 
   describe("retries and replanning", () => {
-    it("never re-assigns a pending task already at max_retries", async () => {
+    it("still runs the last legitimate retry of a pending task at max_retries", async () => {
       insertGoal(db, "goal-1");
       insertTask(db, { id: "task-1", goalId: "goal-1", status: "pending", retryCount: 3, maxRetries: 3 });
+      setState(db, { phase: "executing", goalId: "goal-1" });
+      const spawnAgent = vi.fn(async () => ({ address: "local://local-worker-X", name: "w", sandboxId: "x" }));
+
+      const result = await makeOrchestrator(db, { config: STANDALONE, spawnAgent }).tick();
+
+      expect(spawnAgent).toHaveBeenCalledTimes(1);
+      expect(taskRows(db, "goal-1")[0].status).not.toBe("failed");
+      expect(result.tasksAssigned).toBe(1);
+      expect(result.tasksFailed).toBe(0);
+    });
+
+    it("never re-assigns a pending task past max_retries", async () => {
+      insertGoal(db, "goal-1");
+      insertTask(db, { id: "task-1", goalId: "goal-1", status: "pending", retryCount: 4, maxRetries: 3 });
       setState(db, { phase: "executing", goalId: "goal-1" });
       const spawnAgent = vi.fn(async () => ({ address: "local://local-worker-X", name: "w", sandboxId: "x" }));
 

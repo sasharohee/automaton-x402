@@ -597,9 +597,10 @@ export class Orchestrator {
       .filter((task) => task.goalId === goal.id);
 
     for (const task of ready) {
-      // A task that already used all its attempts never runs again, even if
-      // something put it back to pending.
-      if (task.metadata.retryCount >= task.metadata.maxRetries) {
+      // A task that went past its attempts never runs again, even if something
+      // put it back to pending. retryCount === maxRetries is the last
+      // legitimate retry (failTask re-queues with retry_count + 1).
+      if (task.metadata.retryCount > task.metadata.maxRetries) {
         logger.warn("Task exhausted its retries, failing instead of re-assigning", {
           taskId: task.id,
           retryCount: task.metadata.retryCount,
