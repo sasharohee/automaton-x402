@@ -126,6 +126,14 @@ Other safeguards:
 - The state repository in `~/.automaton` ignores and un-tracks `wallet.json`, `automaton.json` (API keys), `config.json`, `.env*`, `*.key`, databases and logs.
 - Automatic upstream update checks (`check_for_updates`, formerly every 4 h) are off by default; enable them with `"autoUpdate": true` **and** by enabling the heartbeat entry.
 
+### Idle behaviour and work directory
+
+- **Idle sleep backoff.** When the agent only checks its status (3 turns using only read-only tools), repeats the same tool pattern 3 times, ends a turn without any tool call, or has all its delegated work running, it is put to sleep immediately for 5 min, then 10, 20, 40, capped at 60 min. The level is persisted in the database (KV `idle_backoff_level`) and is reset only by a turn that does real work (a mutating tool) or by an inbox message. Tune it with `idleSleepBaseSeconds` (default 300) and `idleSleepMaxSeconds` (default 3600) in `automaton.json`.
+- **No parallel parent turns.** While a local worker executes a task of the active goal and the parent has no task of its own, the parent sleeps; the worker wakes it when it finishes. The worker pool and orchestrator live for the whole process, so a running worker is never mistaken for a dead one.
+- **`check_usdc_balance`** is cached for 5 minutes in standalone mode.
+- **Writable directory.** In standalone mode `write_file` and local workers can only write under `~/work` (created at startup). `~/.automaton`, the rest of `HOME` and the application directory are refused. Conway mode keeps `/root`.
+- **No inbound connectivity.** The system prompt tells the agent that servers it starts are only reachable from localhost, that it has no ETH for gas, and that it should earn only through outbound requests.
+
 The legacy Conway mode is unchanged and remains available with `"providerMode": "conway"` (the default for existing configs).
 
 ## How It Works

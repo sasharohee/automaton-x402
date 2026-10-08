@@ -1,6 +1,7 @@
 import type { Goal, TaskNode } from "./task-graph.js";
 import { UnifiedInferenceClient } from "../inference/inference-client.js";
 import type { ModelTier } from "../inference/provider-registry.js";
+import { STANDALONE_PLANNER_NOTICE } from "../agent/standalone-notice.js";
 
 export interface PlannerOutput {
   analysis: string;
@@ -51,6 +52,8 @@ export interface PlannerContext {
   busyAgents: number;
   maxAgents: number;
   workspaceFiles: string[];
+  /** Standalone mode (no Conway): no inbound connectivity, one local worker. */
+  standalone?: boolean;
 }
 
 export interface PlannerGoalInput {
@@ -108,28 +111,68 @@ export async function replanAfterFailure(
   });
 }
 
-function runPlannerInference(params: {
+/** Thrown when the planner model answered but its output is not a valid PlannerOutput. */
+export class PlannerOutputError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PlannerOutputError";
+  }
+}
+
+/**
+ * Standalone: room for a reasoning model's hidden thinking plus the JSON
+ * answer, so the plan is not cut off mid-string.
+ */
+export const STANDALONE_PLANNER_MAX_TOKENS = 16_000;
+
+async function runPlannerInference(params: {
   mode: "plan_goal" | "replan_after_failure";
   goal: PlannerGoalInput;
   failedTask?: PlannerFailureInput;
   context: PlannerContext;
   inference: UnifiedInferenceClient;
 }): Promise<PlannerOutput> {
-  const systemPrompt = buildPlannerPrompt(params.context);
+  const standalone = params.context.standalone === true;
+  const basePrompt = buildPlannerPrompt(params.context);
+  const systemPrompt = standalone ? `${basePrompt}\n\n${STANDALONE_PLANNER_NOTICE}` : basePrompt;
   const userPrompt = buildPlannerUserPrompt({
     mode: params.mode,
     goal: params.goal,
     failedTask: params.failedTask,
   });
 
-  return params.inference.chat({
-    tier: "reasoning",
-    responseFormat: { type: "json_object" },
-    messages: [
-      { role: "system", content: systemPrompt },
-      { role: "user", content: userPrompt },
-    ],
-  }).then((result) => validatePlannerOutput(parsePlannerResponse(result.content)));
+  const request = async (tier: ModelTier): Promise<PlannerOutput> => {
+    const result = await params.inference.chat({
+      tier,
+      responseFormat: { type: "json_object" },
+      ...(standalone ? { maxTokens: STANDALONE_PLANNER_MAX_TOKENS } : {}),
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+    });
+    const parsed = parsePlannerResponse(result.content);
+    try {
+      return validatePlannerOutput(parsed);
+    } catch (error) {
+      throw new PlannerOutputError(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  if (!standalone) {
+    return request("reasoning");
+  }
+
+  try {
+    return await request("reasoning");
+  } catch (error) {
+    // Only a bad answer is retried, and only once, with the lowCompute model
+    // (tier "fast" in standalone). Inference/payment errors are not retried.
+    if (!(error instanceof PlannerOutputError)) {
+      throw error;
+    }
+    return request("fast");
+  }
 }
 
 export function goalToPlannerInput(goal: Goal): PlannerGoalInput {
@@ -580,14 +623,14 @@ function buildPlannerUserPrompt(params: {
 
 function parsePlannerResponse(content: string): unknown {
   if (content.trim().length === 0) {
-    throw new Error("Planner returned an empty response");
+    throw new PlannerOutputError("Planner returned an empty response");
   }
 
   try {
     return JSON.parse(content);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    throw new Error(`Planner returned invalid JSON: ${message}`);
+    throw new PlannerOutputError(`Planner returned invalid JSON: ${message}`);
   }
 }
 

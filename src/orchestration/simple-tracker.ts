@@ -26,10 +26,14 @@ export class SimpleAgentTracker implements AgentTracker {
         .filter((value): value is string => typeof value === "string" && value.length > 0),
     );
 
+    // Local workers (local://) run exactly one task, handed over at spawn
+    // time: once spawned they can never pick up another task, so they are
+    // never idle candidates (a finished or dead one would be a phantom).
     const children = this.db.raw.prepare(
       `SELECT id, name, address, status, COALESCE(role, 'generalist') AS role
        FROM children
-       WHERE status IN ('running', 'healthy')`,
+       WHERE status IN ('running', 'healthy')
+         AND address NOT LIKE 'local://%'`,
     ).all() as { id: string; name: string; address: string; status: string; role: string }[];
 
     return children

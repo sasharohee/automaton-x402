@@ -328,8 +328,9 @@ export function getGoalProgress(
 ): { total: number; completed: number; failed: number; blocked: number; running: number } {
   const row = db
     .prepare(
+      // Cancelled tasks (e.g. superseded by a replan) are not part of the plan anymore.
       `SELECT
-         COUNT(*) AS total,
+         SUM(CASE WHEN status != 'cancelled' THEN 1 ELSE 0 END) AS total,
          SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed,
          SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
          SUM(CASE WHEN status = 'blocked' THEN 1 ELSE 0 END) AS blocked,

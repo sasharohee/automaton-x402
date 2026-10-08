@@ -11,11 +11,25 @@ export interface LoopCheckResult {
   reason: string;
 }
 
+/**
+ * Signature of one turn's tool calls, used to detect repeated turns.
+ * Calls only count as a repetition when they use the same tools with the
+ * same arguments (three different `exec` commands are normal work), except
+ * for turns made only of status-check tools, which repeat by name alone.
+ */
+export function turnSignature(calls: ReadonlyArray<{ name: string; args: string }>): string {
+  if (calls.every((call) => isIdleOnlyTool(call.name))) {
+    return calls.map((call) => call.name).sort().join(",");
+  }
+  return calls.map((call) => `${call.name}#${simpleHash(call.args)}`).sort().join(",");
+}
+
 export class LoopDetector {
   private readonly config: LoopDetectorConfig;
   private callHistory: Array<{ name: string; argsHash: string }> = [];
   private turnPatterns: string[] = [];
   private currentTurnTools: string[] = [];
+  private currentTurnCalls: Array<{ name: string; args: string }> = [];
   private patternWarningIssued: string | null = null;
   private consecutiveIdleOnlyTurns = 0;
   private currentTurnIsIdleOnly = true;
@@ -32,6 +46,7 @@ export class LoopDetector {
     const argsHash = simpleHash(args);
     this.callHistory.push({ name, argsHash });
     this.currentTurnTools.push(name);
+    this.currentTurnCalls.push({ name, args });
 
     if (!isIdleOnlyTool(name)) {
       this.currentTurnIsIdleOnly = false;
@@ -63,17 +78,20 @@ export class LoopDetector {
   }
 
   endTurn(): LoopCheckResult {
+    // Display form (tool names) vs. comparison form (names + arguments).
     const pattern = [...this.currentTurnTools].sort().join(",");
-    this.turnPatterns.push(pattern);
+    const signature = turnSignature(this.currentTurnCalls);
+    this.currentTurnCalls = [];
+    this.turnPatterns.push(signature);
     if (this.turnPatterns.length > this.config.windowSize) {
       this.turnPatterns = this.turnPatterns.slice(-this.config.windowSize);
     }
 
     if (this.turnPatterns.length >= 3) {
       const last3 = this.turnPatterns.slice(-3);
-      const allSame = last3.every((entry) => entry === pattern);
+      const allSame = last3.every((entry) => entry === signature);
       if (allSame) {
-        if (this.patternWarningIssued === pattern) {
+        if (this.patternWarningIssued === signature) {
           this.patternWarningIssued = null;
           this.turnPatterns = [];
           this.currentTurnTools = [];
@@ -87,7 +105,7 @@ export class LoopDetector {
           };
         }
 
-        this.patternWarningIssued = pattern;
+        this.patternWarningIssued = signature;
         this.currentTurnTools = [];
         this.currentTurnIsIdleOnly = true;
         return {
@@ -100,7 +118,7 @@ export class LoopDetector {
       }
     }
 
-    if (this.patternWarningIssued && pattern !== this.patternWarningIssued) {
+    if (this.patternWarningIssued && signature !== this.patternWarningIssued) {
       this.patternWarningIssued = null;
     }
 
@@ -131,6 +149,7 @@ export class LoopDetector {
     this.callHistory = [];
     this.turnPatterns = [];
     this.currentTurnTools = [];
+    this.currentTurnCalls = [];
     this.patternWarningIssued = null;
     this.consecutiveIdleOnlyTurns = 0;
     this.currentTurnIsIdleOnly = true;

@@ -14,6 +14,7 @@ import { HarnessRegistry } from "../agent/harness-registry.js";
 import { completeTask, failTask } from "./task-graph.js";
 import type { TaskNode } from "./task-graph.js";
 import { AgentWorkspace } from "./workspace.js";
+import { insertWakeEvent } from "../state/database.js";
 import type {
   AutomatonConfig,
   AutomatonIdentity,
@@ -43,14 +44,45 @@ interface LocalWorkerConfig {
   policyEngine?: PolicyEngine;
   spendTracker?: SpendTrackerInterface;
   inputSource?: InputSource;
+  /** Maximum number of workers running at once (unlimited when undefined). */
+  maxConcurrent?: number;
 }
 
 export class LocalWorkerPool {
-  private activeWorkers = new Map<string, { promise: Promise<void>; abortController: AbortController }>();
+  private activeWorkers = new Map<string, {
+    promise: Promise<void>;
+    abortController: AbortController;
+    taskId: string;
+  }>();
 
   constructor(private readonly config: LocalWorkerConfig) {}
 
+  /** True when another worker can be started (see maxConcurrent). */
+  hasCapacity(): boolean {
+    const max = this.config.maxConcurrent;
+    return max === undefined || this.activeWorkers.size < max;
+  }
+
+  /** True when a live worker is already executing this task. */
+  isRunningTask(taskId: string): boolean {
+    for (const worker of this.activeWorkers.values()) {
+      if (worker.taskId === taskId) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   spawn(task: TaskNode): { address: string; name: string; sandboxId: string } {
+    if (this.isRunningTask(task.id)) {
+      throw new Error(`A local worker is already running task ${task.id}`);
+    }
+    if (!this.hasCapacity()) {
+      throw new Error(
+        `Local worker limit reached (${this.activeWorkers.size}/${this.config.maxConcurrent})`,
+      );
+    }
+
     const workerId = `local-worker-${ulid()}`;
     const workerName = `worker-${task.agentRole ?? "generalist"}-${workerId.slice(-6)}`;
     const address = `local://${workerId}`;
@@ -75,9 +107,19 @@ export class LocalWorkerPool {
       })
       .finally(() => {
         this.activeWorkers.delete(workerId);
+        try {
+          // A local worker runs a single task: once it exits, its children
+          // row must never be picked again for an assignment.
+          markLocalWorkerDead(this.config.db, address);
+          // Wake the parent so it reacts to the result instead of waiting
+          // for the end of its idle sleep.
+          insertWakeEvent(this.config.db, "local_worker", `Local worker finished task ${task.id}`);
+        } catch {
+          // Bookkeeping only; never let it crash the pool.
+        }
       });
 
-    this.activeWorkers.set(workerId, { promise: workerPromise, abortController });
+    this.activeWorkers.set(workerId, { promise: workerPromise, abortController, taskId: task.id });
     return { address, name: workerName, sandboxId: workerId };
   }
 
@@ -170,6 +212,25 @@ export class LocalWorkerPool {
       failTask(this.config.db, task.id, message, true);
     }
   }
+}
+
+function markLocalWorkerDead(db: Database, address: string): void {
+  db.prepare(
+    `UPDATE children SET status = 'dead', last_checked = datetime('now')
+     WHERE address = ? AND status NOT IN ('dead', 'failed', 'cleaned_up')`,
+  ).run(address);
+}
+
+/**
+ * Local workers live in process memory: none of them survives a restart.
+ * Called once per process, before the first orchestrator tick.
+ */
+export function markAllLocalWorkersDead(db: Database): number {
+  const result = db.prepare(
+    `UPDATE children SET status = 'dead', last_checked = datetime('now')
+     WHERE address LIKE 'local://%' AND status NOT IN ('dead', 'failed', 'cleaned_up')`,
+  ).run();
+  return result.changes;
 }
 
 function createWorkerIdentity(

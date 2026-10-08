@@ -25,6 +25,7 @@ import { getActiveSkillInstructions } from "../skills/loader.js";
 import { getLineageSummary } from "../replication/lineage.js";
 import { sanitizeInput } from "./injection-defense.js";
 import { loadCurrentSoul } from "../soul/model.js";
+import { STANDALONE_MODE_NOTICE } from "./standalone-notice.js";
 
 function getCoreRules(chainType?: string): string {
   const usdcNetwork = chainType === "solana" ? "USDC on Solana" : "USDC on Base";
@@ -552,18 +553,6 @@ export function getOrchestratorStatus(db: Database.Database): string {
 /**
  * Build the complete system prompt for a turn.
  */
-const STANDALONE_MODE_NOTICE = `--- PROVIDER: STANDALONE (no Conway) ---
-This runtime does NOT use Conway Cloud. Statements above about Conway sandboxes,
-Conway credits, domains or child agents do not apply here:
-- Commands and files run directly on your host machine.
-- Your thinking (inference) is bought per call from BlockRun with USDC from your own
-  wallet on Base, via x402 payments. Every call costs real money.
-- "Credits" means your spendable USDC: on-chain balance minus a protected reserve.
-- Spending is capped per request and per day; the reserve can never be spent.
-- Sandboxes, ports, domains, credit transfers and replication are unavailable.
-- To get more funds, ask your creator to send USDC on Base to your address.
---- END PROVIDER ---`;
-
 export function buildSystemPrompt(params: {
   identity: AutomatonIdentity;
   config: AutomatonConfig;
