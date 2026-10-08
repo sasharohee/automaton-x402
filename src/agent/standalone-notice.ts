@@ -70,13 +70,58 @@ function publicServiceLines(ps: PublicServiceNoticeConfig, walletAddress?: strin
   gas (e.g. register_erc8004).`;
 }
 
-/** Provider notice for the parent agent's system prompt. */
+/**
+ * Permanent security rules for the agent's own public service (public
+ * service mode only). Anyone on the internet can call it: a flaw in it can
+ * leak the wallet key or drain the agent's funds.
+ */
+export const SERVICE_SECURITY_HEADER = "--- SERVICE SECURITY (permanent) ---";
+
+export const SERVICE_SECURITY_SECTION = `${SERVICE_SECURITY_HEADER}
+Your public service is reachable by anyone. Always secure your own code so that nobody
+can steal your funds:
+- Treat every incoming request as hostile.
+- Validate and cap the size of every input (body, headers, query and path parameters)
+  with explicit limits: express.json({ limit: "16kb" }) or similar, a maximum text
+  length, strict types. Reject anything else with 400 or 413.
+- NEVER run a shell command, eval, new Function, child_process, or a file path built
+  from request data.
+- NEVER read, serve or log wallet.json, ~/.automaton, a private key, a mnemonic or the
+  environment variables (process.env).
+- Serve explicit routes only: no static file serving of the home directory or of ~/work.
+- Add a per-IP rate limit on every route, stricter on costly routes.
+- Keep dependencies minimal and pinned (exact versions in package.json, a lockfile).
+- Review your own server code for vulnerabilities BEFORE exposing it and before every
+  change to it.
+- Put the x402 paywall before any costly work (inference, outbound calls, heavy CPU).
+- Return generic error messages: no stack traces, no file paths, no internal details
+  sent to the client.
+--- END SERVICE SECURITY ---`;
+
+/** Short version of the security rules, for the planner and replanner. */
+export const SERVICE_SECURITY_SHORT = `${SERVICE_SECURITY_HEADER}
+Every service task must keep it secure: hostile inputs validated and size-capped, no
+shell/eval/child_process or file paths from request data, never read/serve/log
+wallet.json, ~/.automaton, keys or env vars, explicit routes only (no static serving),
+per-IP rate limits, pinned minimal dependencies, a security review of the server code
+before exposing it, the paywall before costly work, generic error messages.
+--- END SERVICE SECURITY ---`;
+
+/**
+ * Provider notice for the parent agent's system prompt (also embedded in the
+ * worker and planner notices). In public service mode it ends with the
+ * permanent service security section (`short` variant for the planner).
+ */
 export function buildStandaloneModeNotice(
   publicService?: PublicServiceNoticeConfig,
   walletAddress?: string,
+  options: { securityVariant?: "full" | "short" } = {},
 ): string {
   const middle = publicService ? publicServiceLines(publicService, walletAddress) : NO_INBOUND_LINES;
-  return `${NOTICE_HEADER}\n${middle}\n${NOTICE_FOOTER}`;
+  const notice = `${NOTICE_HEADER}\n${middle}\n${NOTICE_FOOTER}`;
+  if (!publicService) return notice;
+  const security = options.securityVariant === "short" ? SERVICE_SECURITY_SHORT : SERVICE_SECURITY_SECTION;
+  return `${notice}\n\n${security}`;
 }
 
 /** Default (no inbound connectivity) notice. */
@@ -139,7 +184,7 @@ export function buildStandalonePlannerNotice(publicService?: PublicServiceNotice
   through OUTBOUND HTTP requests, writing files under ~/work.`;
 
   return `<standalone_runtime>
-${buildStandaloneModeNotice(publicService)}
+${buildStandaloneModeNotice(publicService, undefined, { securityVariant: "short" })}
 
 Planning rules for this runtime (they override anything above):
 ${connectivityRules}

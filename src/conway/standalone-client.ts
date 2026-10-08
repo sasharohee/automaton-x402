@@ -26,7 +26,7 @@ import type {
   DnsRecord,
   ModelInfo,
 } from "../types.js";
-import { execLocal, writeFileLocal, readFileLocal } from "./local-exec.js";
+import { execLocal, scrubSecretEnv, writeFileLocal, readFileLocal } from "./local-exec.js";
 import { getUsdcBalanceDetailed } from "./x402.js";
 
 export class ProviderUnsupportedError extends Error {
@@ -78,8 +78,9 @@ export function createStandaloneClient(options: StandaloneClientOptions): Conway
   };
 
   const client: ConwayClient = {
+    // Commands never inherit secret-looking env vars (API keys set by the loop).
     exec: async (command: string, timeout?: number): Promise<ExecResult> =>
-      execLocal(command, timeout),
+      execLocal(command, timeout, { env: scrubSecretEnv() }),
     writeFile: async (path: string, content: string) => writeFileLocal(path, content),
     readFile: async (path: string) => readFileLocal(path),
 

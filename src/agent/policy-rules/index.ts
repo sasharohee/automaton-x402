@@ -14,6 +14,7 @@ import { createFinancialRules } from "./financial.js";
 import { createAuthorityRules } from "./authority.js";
 import { createRateLimitRules } from "./rate-limits.js";
 import { createProviderModeRules } from "./provider-mode.js";
+import { createSecretAccessRules } from "./secret-access.js";
 
 /**
  * Create the default set of policy rules.
@@ -30,5 +31,6 @@ export function createDefaultRules(
     ...createAuthorityRules(),
     ...createRateLimitRules(),
     ...createProviderModeRules(),
+    ...createSecretAccessRules(),
   ];
 }
