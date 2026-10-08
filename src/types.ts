@@ -393,6 +393,11 @@ export interface InferenceResponse {
   toolCalls?: InferenceToolCall[];
   usage: TokenUsage;
   finishReason: string;
+  /**
+   * Amount actually paid for this call via x402, in cents (fractional).
+   * Unset when the call was not paid per request (e.g. other providers).
+   */
+  chargedCents?: number;
 }
 
 export interface InferenceOptions {
@@ -629,13 +634,39 @@ export interface SpendEntry {
   category: SpendCategory;
 }
 
+/**
+ * Which cap refused a spend: the category's hourly cap, the category's
+ * daily cap, or the global daily cap (all categories combined).
+ */
+export type SpendLimitType = "hourly" | "daily" | "global_daily";
+
 export interface LimitCheckResult {
   allowed: boolean;
   reason?: string;
+  /** Set when allowed === false: the cap that refused. */
+  limitType?: SpendLimitType;
   currentHourlySpend: number;
   currentDailySpend: number;
   limitHourly: number;
   limitDaily: number;
+  /** Set on a global_daily refusal. */
+  currentTotalDailySpend?: number;
+  limitTotalDaily?: number;
+}
+
+/**
+ * Structured description of a cap refusal, carried from the spend guard
+ * through X402PaymentError so callers never have to parse messages.
+ */
+export interface SpendLimitRefusal {
+  limitType: SpendLimitType;
+  category: SpendCategory;
+  /** Spend already counted in the refusing window, in cents. */
+  currentCents: number;
+  /** Amount of the refused payment, in cents. */
+  amountCents: number;
+  /** The cap of the refusing window, in cents. */
+  limitCents: number;
 }
 
 export interface TreasuryPolicy {

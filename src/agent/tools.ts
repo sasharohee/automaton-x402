@@ -3355,6 +3355,57 @@ export function toolsToInferenceFormat(
  * Execute a tool call and return the result.
  * Optionally evaluates against the policy engine before execution.
  */
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function matchesSchemaType(value: unknown, type: string): boolean {
+  switch (type) {
+    case "string":
+      return typeof value === "string";
+    case "number":
+      return typeof value === "number" && Number.isFinite(value);
+    case "integer":
+      return typeof value === "number" && Number.isInteger(value);
+    case "boolean":
+      return typeof value === "boolean";
+    case "object":
+      return isPlainObject(value);
+    case "array":
+      return Array.isArray(value);
+    default:
+      return true; // unknown / unchecked type
+  }
+}
+
+/**
+ * Check tool arguments against the tool's JSON schema: arguments must be an
+ * object, and every required parameter must be present with its declared
+ * primitive type. Returns an error message, or null if the arguments are valid.
+ */
+export function validateToolArgs(tool: AutomatonTool, args: unknown): string | null {
+  if (!isPlainObject(args)) {
+    const kind = args === null ? "null" : Array.isArray(args) ? "an array" : typeof args;
+    return `Invalid arguments for ${tool.name}: expected a JSON object, got ${kind}`;
+  }
+  const schema = tool.parameters as { properties?: Record<string, any>; required?: unknown } | undefined;
+  const required = Array.isArray(schema?.required) ? (schema!.required as unknown[]) : [];
+  for (const name of required) {
+    if (typeof name !== "string") continue;
+    const value = args[name];
+    if (value === undefined || value === null) {
+      return `Missing required parameter "${name}" for ${tool.name}`;
+    }
+    const declared = schema?.properties?.[name]?.type;
+    const types = Array.isArray(declared) ? declared : typeof declared === "string" ? [declared] : [];
+    if (types.length > 0 && !types.some((t: unknown) => typeof t === "string" && matchesSchemaType(value, t))) {
+      const actual = Array.isArray(value) ? "array" : typeof value;
+      return `Invalid parameter "${name}" for ${tool.name}: expected ${types.join(" | ")}, got ${actual}`;
+    }
+  }
+  return null;
+}
+
 export async function executeTool(
   toolName: string,
   args: Record<string, unknown>,
@@ -3378,6 +3429,19 @@ export async function executeTool(
       result: "",
       durationMs: 0,
       error: `Unknown tool: ${toolName}`,
+    };
+  }
+
+  // Reject malformed arguments before any policy rule or tool code sees them.
+  const argsError = validateToolArgs(tool, args);
+  if (argsError) {
+    return {
+      id: ulid(),
+      name: toolName,
+      arguments: isPlainObject(args) ? args : {},
+      result: "",
+      durationMs: 0,
+      error: `${argsError}; the tool was NOT run.`,
     };
   }
 

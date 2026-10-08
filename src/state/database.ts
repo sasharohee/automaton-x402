@@ -1455,6 +1455,21 @@ export function resetInboxToReceived(db: DatabaseType, ids: string[]): void {
   ).run(...ids);
 }
 
+/**
+ * Undo a claim without consuming a retry: in_progress → received and give
+ * back the retry_count increment made by claimInboxMessages(). Used when a
+ * turn could not run at all (e.g. a spend cap), not when it failed.
+ */
+export function releaseInboxClaim(db: DatabaseType, ids: string[]): void {
+  if (ids.length === 0) return;
+  const placeholders = ids.map(() => '?').join(',');
+  db.prepare(
+    `UPDATE inbox_messages
+     SET status = 'received', retry_count = MAX(retry_count - 1, 0)
+     WHERE id IN (${placeholders}) AND status = 'in_progress'`,
+  ).run(...ids);
+}
+
 export function getUnprocessedInboxCount(db: DatabaseType): number {
   const row = db.prepare(
     "SELECT COUNT(*) as count FROM inbox_messages WHERE status IN ('received','in_progress')",

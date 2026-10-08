@@ -22,6 +22,7 @@ import type {
 import { ModelRegistry } from "./registry.js";
 import { InferenceBudgetTracker } from "./budget.js";
 import { DEFAULT_ROUTING_MATRIX, TASK_TIMEOUTS } from "./types.js";
+import { getX402Payment } from "../conway/x402-v2.js";
 
 type Database = BetterSqlite3.Database;
 
@@ -135,6 +136,25 @@ export class InferenceRouter {
       }
     } catch (error: any) {
       const latencyMs = Date.now() - startTime;
+      // A paid request that failed client-side (e.g. aborted on timeout)
+      // may still have been settled: record what we paid for it.
+      const payment = getX402Payment(error);
+      const chargedCents = payment ? payment.amountCents : 0;
+      if (payment) {
+        this.budget.recordCost({
+          sessionId,
+          turnId: turnId || null,
+          model: model.modelId,
+          provider: model.provider,
+          inputTokens: 0,
+          outputTokens: 0,
+          costCents: chargedCents,
+          latencyMs,
+          tier,
+          taskType,
+          cacheHit: false,
+        });
+      }
       // If fallback is enabled, try next candidate
       if (error.name === "AbortError") {
         return {
@@ -143,7 +163,7 @@ export class InferenceRouter {
           provider: model.provider,
           inputTokens: 0,
           outputTokens: 0,
-          costCents: 0,
+          costCents: chargedCents,
           latencyMs,
           finishReason: "timeout",
         };
@@ -152,13 +172,17 @@ export class InferenceRouter {
     }
     const latencyMs = Date.now() - startTime;
 
-    // 7. Calculate actual cost
+    // 7. Calculate actual cost: the x402 amount paid for this call when
+    // there was one, otherwise the token × static-price estimate.
     const inputTokens = response.usage?.promptTokens || 0;
     const outputTokens = response.usage?.completionTokens || 0;
-    const actualCostCents = Math.ceil(
-      (inputTokens / 1000) * model.costPer1kInput / 100 +
-      (outputTokens / 1000) * model.costPer1kOutput / 100,
-    );
+    const actualCostCents =
+      typeof response.chargedCents === "number" && Number.isFinite(response.chargedCents)
+        ? response.chargedCents
+        : Math.ceil(
+            (inputTokens / 1000) * model.costPer1kInput / 100 +
+            (outputTokens / 1000) * model.costPer1kOutput / 100,
+          );
 
     // 8. Record cost
     this.budget.recordCost({
