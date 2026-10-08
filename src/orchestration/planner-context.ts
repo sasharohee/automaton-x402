@@ -20,6 +20,10 @@ export interface PlannerContextOptions {
   idleAgents?: number;
   busyAgents?: number;
   maxAgents?: number;
+  /** Standalone mode (no Conway): the planner gets the runtime's constraints. */
+  standalone?: boolean;
+  /** Standalone only: the single public HTTP service port, when configured. */
+  publicService?: { publicUrl: string; servicePort: number };
 }
 
 export const DEFAULT_PLANNER_AVAILABLE_ROLES = [
@@ -59,6 +63,8 @@ export async function buildPlannerContext(options: PlannerContextOptions): Promi
     busyAgents: clampCount(options.busyAgents),
     maxAgents: Math.max(1, clampCount(options.maxAgents, 1)),
     workspaceFiles: listWorkspaceFiles(options.workspace),
+    ...(options.standalone ? { standalone: true } : {}),
+    ...(options.standalone && options.publicService ? { publicService: options.publicService } : {}),
   };
 }
 

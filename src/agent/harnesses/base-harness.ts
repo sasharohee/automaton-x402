@@ -2,6 +2,9 @@ import { createLogger } from "../../observability/logger.js";
 import type { ChatMessage, InferenceToolCall } from "../../types.js";
 import type { TaskNode, TaskResult } from "../../orchestration/task-graph.js";
 import { LoopDetector } from "../loop-detector.js";
+import { buildStandaloneWorkerNotice } from "../standalone-notice.js";
+import { isStandalone } from "../../conway/provider.js";
+import { getPublicService } from "../public-service.js";
 import type {
   AgentHarness,
   HarnessContext,
@@ -31,7 +34,7 @@ export abstract class BaseHarness implements AgentHarness {
       windowSize: 10,
     });
     this.messages = [
-      { role: "system", content: this.buildSystemPrompt() },
+      { role: "system", content: this.composeSystemPrompt() },
       { role: "user", content: this.buildTaskPrompt() },
     ];
     this.artifacts = [];
@@ -39,6 +42,24 @@ export abstract class BaseHarness implements AgentHarness {
 
   abstract getToolDefs(): HarnessTool[];
   abstract buildSystemPrompt(): string;
+
+  /**
+   * The harness system prompt plus, in standalone mode, the provider notice
+   * (no inbound connectivity — or the single public service port when
+   * configured — outbound earning, no ETH, ~/work only).
+   */
+  composeSystemPrompt(): string {
+    const base = this.buildSystemPrompt();
+    if (!isStandalone(this.context?.config)) {
+      return base;
+    }
+    const notice = buildStandaloneWorkerNotice(
+      this.context.allowedEditRoot,
+      getPublicService(this.context.config),
+      this.context.config.walletAddress || undefined,
+    );
+    return `${base}\n\n${notice}`;
+  }
 
   protected beforeTurn(): void {}
 

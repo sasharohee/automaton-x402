@@ -11,13 +11,35 @@ import fs from "fs";
 import nodePath from "path";
 import type { ExecResult } from "../types.js";
 
-export function execLocal(command: string, timeout?: number): ExecResult {
+/** Environment variable names that may hold a secret (API keys, tokens, keys, mnemonics). */
+const SECRET_ENV_NAME_RE = /KEY|SECRET|TOKEN|PASSW(OR)?D|PRIVATE|MNEMONIC|SEED|CREDENTIAL|AUTH(?!OR)|COOKIE/i;
+
+/**
+ * Copy of `env` without variables whose name looks like a secret. Used for
+ * commands run by the agent in standalone mode, so that a process it starts
+ * (e.g. its public server) does not inherit the API keys the agent loop puts
+ * in process.env.
+ */
+export function scrubSecretEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const clean: NodeJS.ProcessEnv = {};
+  for (const [name, value] of Object.entries(env)) {
+    if (!SECRET_ENV_NAME_RE.test(name)) clean[name] = value;
+  }
+  return clean;
+}
+
+export function execLocal(
+  command: string,
+  timeout?: number,
+  options: { env?: NodeJS.ProcessEnv } = {},
+): ExecResult {
   try {
     const stdout = execSync(command, {
       timeout: timeout || 30_000,
       encoding: "utf-8",
       maxBuffer: 10 * 1024 * 1024,
       cwd: process.env.HOME || "/root",
+      ...(options.env ? { env: options.env } : {}),
     });
     return { stdout: stdout || "", stderr: "", exitCode: 0 };
   } catch (err: any) {

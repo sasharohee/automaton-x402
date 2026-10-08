@@ -58,20 +58,50 @@ import { Orchestrator } from "../orchestration/orchestrator.js";
 import { PlanModeController } from "../orchestration/plan-mode.js";
 import { generateTodoMd, injectTodoContext } from "../orchestration/attention.js";
 import { ColonyMessaging, LocalDBTransport } from "../orchestration/messaging.js";
-import { LocalWorkerPool } from "../orchestration/local-worker.js";
+import { LocalWorkerPool, markAllLocalWorkersDead } from "../orchestration/local-worker.js";
 import { SimpleAgentTracker, SimpleFundingProtocol } from "../orchestration/simple-tracker.js";
 import { HarnessRegistry } from "./harness-registry.js";
 import { createWorkerInferenceBridge } from "./worker-inference-bridge.js";
 import { ProviderRegistry } from "../inference/provider-registry.js";
 import { UnifiedInferenceClient } from "../inference/inference-client.js";
 import { isIdleOnlyTool } from "./idle-only-tools.js";
+import { turnSignature } from "./loop-detector.js";
 import { isStandalone, filterToolsForProvider, resolveBlockRunConfig } from "../conway/provider.js";
 import { buildRoutingMatrix, registerMappedModels } from "../inference/model-map.js";
+import { scheduleIdleSleep, resetIdleBackoff } from "./idle-backoff.js";
+import { ensureStandaloneWorkDir } from "./workdir.js";
+import { buildStandaloneEarningGuidance } from "./standalone-notice.js";
+import { getPublicService, probeLocalPort } from "./public-service.js";
 
 const logger = createLogger("loop");
 const MAX_TOOL_CALLS_PER_TURN = 10;
 const MAX_CONSECUTIVE_ERRORS = 5;
 const MAX_REPETITIVE_TURNS = 3;
+/** Consecutive idle-only turns, persisted across wakes. */
+const IDLE_TOOL_TURNS_KEY = "loop.idle_tool_turns";
+/** Reason for the last idle sleep, appended to the next wakeup prompt. */
+const IDLE_SLEEP_NOTE_KEY = "loop.idle_sleep_note";
+
+/**
+ * Tools that count as real work. Used both for idle-turn detection and to
+ * reset the idle sleep backoff.
+ */
+const MUTATING_TOOLS = new Set([
+  "exec", "write_file", "edit_own_file", "transfer_credits", "topup_credits", "fund_child",
+  "spawn_child", "start_child", "delete_sandbox", "create_sandbox",
+  "install_npm_package", "install_mcp_server", "install_skill",
+  "create_skill", "remove_skill", "install_skill_from_git",
+  "install_skill_from_url", "pull_upstream", "git_commit", "git_push",
+  "git_branch", "git_clone", "send_message", "message_child",
+  "register_domain", "register_erc8004", "give_feedback",
+  "update_genesis_prompt", "update_agent_card", "modify_heartbeat",
+  "expose_port", "remove_port", "x402_fetch", "manage_dns",
+  "distress_signal", "prune_dead_children", "sleep",
+  "update_soul", "remember_fact", "set_goal", "complete_goal",
+  "save_procedure", "note_about_agent", "forget",
+  "enter_low_compute", "switch_model", "review_upstream_changes",
+]);
+
 
 export interface AgentLoopOptions {
   identity: AutomatonIdentity;
@@ -101,6 +131,8 @@ export async function runAgentLoop(
     options;
 
   const standalone = isStandalone(config);
+  const publicService = getPublicService(config);
+  const standaloneEarningGuidance = buildStandaloneEarningGuidance(publicService);
   const builtinTools = createBuiltinTools(identity.sandboxId);
   const installedTools = loadInstalledTools(db);
   // Standalone mode: Conway-only tools (sandboxes, ports, domains, credit
@@ -142,241 +174,19 @@ export async function runAgentLoop(
     blockrunConfig ? buildRoutingMatrix(blockrunConfig.models) : undefined,
   );
 
-  // Optional orchestration bootstrap (requires V9 goals/task tables)
-  let planModeController: PlanModeController | undefined;
-  let orchestrator: Orchestrator | undefined;
-  let workerPool: LocalWorkerPool | undefined;
-
-  if (hasTable(db.raw, "goals")) {
-    try {
-      planModeController = new PlanModeController(db.raw);
-
-      let registry: ProviderRegistry;
-      if (blockrunConfig && options.blockrunFetch) {
-        // Standalone: orchestrator/workers use BlockRun, paid via the same
-        // guarded x402 fetch as the main loop (shared caps and reserve).
-        registry = ProviderRegistry.forBlockRun({
-          apiUrl: blockrunConfig.apiUrl,
-          models: {
-            reasoning: blockrunConfig.models.normal,
-            fast: blockrunConfig.models.lowCompute,
-            cheap: blockrunConfig.models.critical,
-          },
-          paidFetch: options.blockrunFetch,
-        });
-      } else {
-        // Bridge automaton config API keys to env vars for the provider registry.
-        // The registry reads keys from process.env; the automaton config may have
-        // them from config.json or Conway provisioning.
-        if (config.openaiApiKey && !process.env.OPENAI_API_KEY) {
-          process.env.OPENAI_API_KEY = config.openaiApiKey;
-        }
-        if (config.anthropicApiKey && !process.env.ANTHROPIC_API_KEY) {
-          process.env.ANTHROPIC_API_KEY = config.anthropicApiKey;
-        }
-        // Conway Compute API is OpenAI-compatible. Use it as fallback when no
-        // direct OpenAI key is available. The conwayApiKey is always present
-        // (required for sandbox operations), so this ensures the orchestrator
-        // can always make inference calls.
-        if (config.conwayApiKey && !process.env.CONWAY_API_KEY) {
-          process.env.CONWAY_API_KEY = config.conwayApiKey;
-        }
-        // If no OpenAI key is set but Conway key is available, use Conway as
-        // the OpenAI provider (Conway Compute is OpenAI API-compatible).
-        if (!process.env.OPENAI_API_KEY && config.conwayApiKey) {
-          process.env.OPENAI_API_KEY = config.conwayApiKey;
-          process.env.OPENAI_BASE_URL = `${config.conwayApiUrl}/v1`;
-        }
-
-        const providersPath = path.join(
-          process.env.HOME || process.cwd(),
-          ".automaton",
-          "inference-providers.json",
-        );
-        registry = ProviderRegistry.fromConfig(providersPath);
-
-        // If OPENAI_BASE_URL was set (Conway fallback), update the default
-        // provider's baseUrl so the OpenAI client points to Conway Compute.
-        if (process.env.OPENAI_BASE_URL) {
-          registry.overrideBaseUrl("openai", process.env.OPENAI_BASE_URL);
-        }
-      }
-
-      const unifiedInference = new UnifiedInferenceClient(registry);
-      const agentTracker = new SimpleAgentTracker(db);
-      const funding = new SimpleFundingProtocol(conway, identity, db);
-      const messaging = new ColonyMessaging(
-        new LocalDBTransport(db),
-        db,
-      );
-
-      const harnessRegistry = new HarnessRegistry();
-
-      // Adapter: local workers use the unified inference path so planner-backed
-      // harnesses can preserve tier + responseFormat contracts.
-      const workerInference = createWorkerInferenceBridge(unifiedInference);
-
-      // Local worker pool: runs inference-driven agents in-process
-      // as async tasks. Falls back from Conway sandbox spawning.
-      const initializedWorkerPool = new LocalWorkerPool({
-        db: db.raw,
-        inference: workerInference,
-        conway,
-        harnessRegistry,
-        identity,
-        config,
-        allowedEditRoot: process.cwd(),
-        tools,
-        toolContext,
-        policyEngine,
-        spendTracker,
-      });
-      workerPool = initializedWorkerPool;
-
-      orchestrator = new Orchestrator({
-        db: db.raw,
-        agentTracker,
-        funding,
-        messaging,
-        inference: unifiedInference,
-        identity,
-        isWorkerAlive: (address: string) => {
-          if (address.startsWith("local://")) {
-            return initializedWorkerPool.hasWorker(address);
-          }
-          // Remote workers: check children table
-          const child = db.raw.prepare(
-            "SELECT status FROM children WHERE sandbox_id = ? OR address = ?",
-          ).get(address, address) as { status: string } | undefined;
-          if (!child) return false;
-          return !["failed", "dead", "cleaned_up"].includes(child.status);
-        },
-        config: {
-          ...config,
-          spawnAgent: async (task: any) => {
-            // Standalone: no sandboxes and no replication — in-process workers only.
-            if (standalone) {
-              try {
-                return initializedWorkerPool.spawn(task);
-              } catch (localError) {
-                logger.warn("Failed to spawn local worker", {
-                  taskId: task.id,
-                  error: localError instanceof Error ? localError.message : String(localError),
-                });
-                return null;
-              }
-            }
-
-            // Try Conway sandbox spawn first (production)
-            try {
-              const { generateGenesisConfig } = await import("../replication/genesis.js");
-              const { spawnChild } = await import("../replication/spawn.js");
-              const { ChildLifecycle } = await import("../replication/lifecycle.js");
-
-              const role = task.agentRole ?? "generalist";
-              const genesis = generateGenesisConfig(identity, config, {
-                name: `worker-${role}-${Date.now().toString(36)}`,
-                specialization: `${role}: ${task.title}`,
-              });
-
-              const lifecycle = new ChildLifecycle(db.raw);
-              const child = await spawnChild(conway, identity, db, genesis, lifecycle);
-
-              return {
-                address: child.address,
-                name: child.name,
-                sandboxId: child.sandboxId,
-              };
-            } catch (sandboxError: any) {
-              // If the error is a 402 (insufficient credits), attempt topup and retry once
-              const is402 = sandboxError?.status === 402 ||
-                sandboxError?.message?.includes("INSUFFICIENT_CREDITS");
-
-              if (is402) {
-                const SANDBOX_TOPUP_COOLDOWN_MS = 60_000;
-                const lastAttempt = db.getKV("last_sandbox_topup_attempt");
-                const cooldownExpired = !lastAttempt ||
-                  Date.now() - new Date(lastAttempt).getTime() >= SANDBOX_TOPUP_COOLDOWN_MS;
-
-                if (cooldownExpired) {
-                  db.setKV("last_sandbox_topup_attempt", new Date().toISOString());
-                  try {
-                    const { topupForSandbox } = await import("../conway/topup.js");
-                    const topupResult = await topupForSandbox({
-                      apiUrl: config.conwayApiUrl,
-                      account: identity.account,
-                      error: sandboxError,
-                      chainType: config.chainType || identity.chainType || "evm",
-                    });
-
-                    if (topupResult?.success) {
-                      logger.info(`Sandbox topup succeeded ($${topupResult.amountUsd}), retrying spawn`, {
-                        taskId: task.id,
-                      });
-                      // Retry spawn once after successful topup
-                      try {
-                        const { generateGenesisConfig: genGenesis } = await import("../replication/genesis.js");
-                        const { spawnChild: retrySpawn } = await import("../replication/spawn.js");
-                        const { ChildLifecycle: RetryLifecycle } = await import("../replication/lifecycle.js");
-
-                        const retryRole = task.agentRole ?? "generalist";
-                        const retryGenesis = genGenesis(identity, config, {
-                          name: `worker-${retryRole}-${Date.now().toString(36)}`,
-                          specialization: `${retryRole}: ${task.title}`,
-                        });
-                        const retryLifecycle = new RetryLifecycle(db.raw);
-                        const child = await retrySpawn(conway, identity, db, retryGenesis, retryLifecycle);
-                        return {
-                          address: child.address,
-                          name: child.name,
-                          sandboxId: child.sandboxId,
-                        };
-                      } catch (retryError) {
-                        logger.warn("Spawn retry after topup failed", {
-                          taskId: task.id,
-                          error: retryError instanceof Error ? retryError.message : String(retryError),
-                        });
-                      }
-                    }
-                  } catch (topupError) {
-                    logger.warn("Sandbox topup attempt failed", {
-                      taskId: task.id,
-                      error: topupError instanceof Error ? topupError.message : String(topupError),
-                    });
-                  }
-                }
-              }
-
-              // Conway sandbox unavailable — fall back to local worker
-              logger.info("Conway sandbox unavailable, spawning local worker", {
-                taskId: task.id,
-                error: sandboxError instanceof Error ? sandboxError.message : String(sandboxError),
-              });
-
-              try {
-                const spawned = initializedWorkerPool.spawn(task);
-                return spawned;
-              } catch (localError) {
-                logger.warn("Failed to spawn local worker", {
-                  taskId: task.id,
-                  error: localError instanceof Error ? localError.message : String(localError),
-                });
-                return null;
-              }
-            }
-          },
-        },
-      });
-    } catch (error) {
-      logger.warn(
-        `Orchestrator initialization failed, continuing without orchestration: ${
-          error instanceof Error ? error.message : String(error)
-        }`,
-      );
-      planModeController = undefined;
-      orchestrator = undefined;
-    }
-  }
+  // Optional orchestration bootstrap (requires V9 goals/task tables).
+  // Created once per process and reused across wake/sleep cycles so the
+  // worker pool keeps track of workers that are still running.
+  const orchestration = getOrCreateOrchestrationRuntime({
+    options,
+    standalone,
+    blockrunConfig,
+    tools,
+    toolContext,
+  });
+  const planModeController = orchestration?.planModeController;
+  const orchestrator = orchestration?.orchestrator;
+  const workerPool = orchestration?.workerPool;
 
   // Set start time
   if (!db.getKV("start_time")) {
@@ -386,9 +196,19 @@ export async function runAgentLoop(
   let consecutiveErrors = 0;
   let running = true;
   let lastToolPatterns: string[] = [];
-  let loopWarningPattern: string | null = null;
-  let idleToolTurns = 0;
+  // Persisted across wakes so an agent that wakes up and only checks its
+  // status goes straight back to sleep.
+  let idleToolTurns = parseInt(db.getKV(IDLE_TOOL_TURNS_KEY) || "0", 10) || 0;
   // blockedGoalTurns removed — replaced by immediate sleep + exponential backoff
+
+  /** Put the agent to sleep with the persisted idle backoff (5/10/20/40/60 min). */
+  const sleepWithBackoff = (reason: string): void => {
+    const sleepMs = scheduleIdleSleep(db, config);
+    log(config, `${reason} Sleeping ${Math.round(sleepMs / 1000)}s (idle backoff).`);
+    db.setAgentState("sleeping");
+    onStateChange?.("sleeping");
+    running = false;
+  };
 
   // Drain any stale wake events from before this loop started,
   // so they don't re-wake the agent after its first sleep.
@@ -410,12 +230,19 @@ export async function runAgentLoop(
   const isFirstRun = db.getTurnCount() === 0;
 
   // Build wakeup prompt
-  const wakeupInput = buildWakeupPrompt({
+  let wakeupInput = buildWakeupPrompt({
     identity,
     config,
     financial,
     db,
   });
+  // Why the agent was put to sleep last time (loop detectors no longer
+  // inject a message mid-cycle; the note rides along with the wakeup turn).
+  const idleSleepNote = db.getKV(IDLE_SLEEP_NOTE_KEY);
+  if (idleSleepNote) {
+    wakeupInput = `${wakeupInput}\n\n${idleSleepNote}`;
+    db.deleteKV(IDLE_SLEEP_NOTE_KEY);
+  }
 
   // Transition to running
   db.setAgentState("running");
@@ -457,6 +284,8 @@ export async function runAgentLoop(
       if (!pendingInput) {
         claimedMessages = claimInboxMessages(db.raw, 10);
         if (claimedMessages.length > 0) {
+          // A real message arrived: the agent has something to do again.
+          resetIdleBackoff(db);
           const formatted = claimedMessages
             .map((m) => {
               const from = sanitizeInput(m.fromAddress, m.fromAddress, "social_address");
@@ -473,6 +302,9 @@ export async function runAgentLoop(
 
       // Refresh financial state periodically
       financial = await getFinancialState(conway, identity.address, db, config.chainType || identity.chainType || "evm");
+      if (orchestration) {
+        orchestration.latestFinancial = financial.creditsCents === -1 ? undefined : financial;
+      }
 
       // Check survival tier
       // api_unreachable: creditsCents === -1 means API failed with no cache.
@@ -548,6 +380,11 @@ export async function runAgentLoop(
       const recentTurns = trimContext(
         meaningfulTurns.length > 0 ? meaningfulTurns : allTurns.slice(-2),
       );
+      // Public service mode: tell the agent whether its server answers on the
+      // public port (local TCP probe, no inference) so it knows to restart it.
+      const publicServiceListening = publicService
+        ? await probeLocalPort(publicService.servicePort)
+        : undefined;
       const systemPrompt = buildSystemPrompt({
         identity,
         config,
@@ -557,6 +394,7 @@ export async function runAgentLoop(
         tools,
         skills,
         isFirstRun,
+        publicServiceListening,
       });
 
       // Phase 2.2: Pre-turn memory retrieval
@@ -591,35 +429,51 @@ export async function runAgentLoop(
         const hasSelfAssignedParentTask = !!db.raw.prepare(
           `SELECT 1 FROM task_graph WHERE assigned_to = ? AND status IN ('assigned', 'running') LIMIT 1`,
         ).get(identity.address);
-
-        if (
-          orchestratorTick.phase === "executing" &&
-          orchestratorTick.tasksAssigned === 0 &&
-          orchestratorTick.tasksCompleted === 0 &&
-          orchestratorTick.tasksFailed === 0 &&
-          !hasSelfAssignedParentTask &&
-          (orchestratorTick.agentsActive > 0 || localWorkersActive > 0)
-        ) {
-          log(
-            config,
-            "[ORCHESTRATOR] All delegated work is active and no self-assigned parent task remains. Sleeping to avoid idle loop.",
-          );
-          db.setKV("sleep_until", new Date(Date.now() + 60_000).toISOString());
-          db.setAgentState("sleeping");
-          onStateChange?.("sleeping");
-          running = false;
-          break;
-        }
+        // A message from another agent or the creator always gets a turn.
+        const hasInboxInput = pendingInput?.source === "agent";
 
         if (
           orchestratorTick.tasksAssigned > 0 ||
           orchestratorTick.tasksCompleted > 0 ||
-          orchestratorTick.tasksFailed > 0
+          orchestratorTick.tasksFailed > 0 ||
+          (orchestratorTick.tasksRecovered ?? 0) > 0
         ) {
           log(
             config,
-            `[ORCHESTRATOR] phase=${orchestratorTick.phase} assigned=${orchestratorTick.tasksAssigned} completed=${orchestratorTick.tasksCompleted} failed=${orchestratorTick.tasksFailed}`,
+            `[ORCHESTRATOR] phase=${orchestratorTick.phase} assigned=${orchestratorTick.tasksAssigned} completed=${orchestratorTick.tasksCompleted} failed=${orchestratorTick.tasksFailed} recovered=${orchestratorTick.tasksRecovered ?? 0}`,
           );
+        }
+
+        if (!hasSelfAssignedParentTask && !hasInboxInput) {
+          // A local worker is executing a task of the active goal: parent
+          // turns in parallel would only duplicate its work (and its spend).
+          // The worker wakes the parent when it finishes.
+          const runningLocalTask = workerPool && localWorkersActive > 0
+            ? (db.raw.prepare(
+                `SELECT assigned_to AS address FROM task_graph
+                 WHERE assigned_to LIKE 'local://%' AND status IN ('assigned', 'running')`,
+              ).all() as { address: string }[]).some((row) => workerPool.hasWorker(row.address))
+            : false;
+
+          if (runningLocalTask) {
+            sleepWithBackoff(
+              "[ORCHESTRATOR] A local worker is executing the active goal and the parent has no task of its own.",
+            );
+            break;
+          }
+
+          if (
+            orchestratorTick.phase === "executing" &&
+            orchestratorTick.tasksAssigned === 0 &&
+            orchestratorTick.tasksCompleted === 0 &&
+            orchestratorTick.tasksFailed === 0 &&
+            (orchestratorTick.agentsActive > 0 || localWorkersActive > 0)
+          ) {
+            sleepWithBackoff(
+              "[ORCHESTRATOR] All delegated work is active and no self-assigned parent task remains.",
+            );
+            break;
+          }
         }
       }
 
@@ -781,83 +635,71 @@ export async function runAgentLoop(
         db.deleteKV("blocked_goal_backoff");
       }
 
+      // ── Idle backoff reset ──
+      // Only a turn that does real work (a mutating tool other than sleep
+      // itself) clears the idle sleep backoff.
+      const didRealWork = turn.toolCalls.some(
+        (tc) => MUTATING_TOOLS.has(tc.name) && tc.name !== "sleep" && !tc.error,
+      );
+      if (didRealWork) {
+        resetIdleBackoff(db);
+      }
+
       // ── Loop Detection ──
       if (turn.toolCalls.length > 0) {
         const currentPattern = turn.toolCalls
           .map((tc) => tc.name)
           .sort()
           .join(",");
-        lastToolPatterns.push(currentPattern);
+        // Repetition = same tools with the same arguments (or status checks
+        // only). Different exec commands in a row are normal work.
+        const currentSignature = turnSignature(
+          turn.toolCalls.map((tc) => ({ name: tc.name, args: JSON.stringify(tc.arguments ?? {}) })),
+        );
+        lastToolPatterns.push(currentSignature);
 
         // Keep only the last MAX_REPETITIVE_TURNS entries
         if (lastToolPatterns.length > MAX_REPETITIVE_TURNS) {
           lastToolPatterns = lastToolPatterns.slice(-MAX_REPETITIVE_TURNS);
         }
 
-        // Reset enforcement tracker if agent changed behavior
-        if (loopWarningPattern && currentPattern !== loopWarningPattern) {
-          loopWarningPattern = null;
-        }
-
-        // ── Loop Enforcement Escalation ──
-        // If we already warned about this pattern and the agent STILL repeats, force sleep.
-        if (
-          loopWarningPattern &&
-          currentPattern === loopWarningPattern &&
-          lastToolPatterns.length === MAX_REPETITIVE_TURNS &&
-          lastToolPatterns.every((p) => p === currentPattern)
-        ) {
-          log(config, `[LOOP] Enforcement: agent ignored loop warning, forcing sleep.`);
-          pendingInput = {
-            content:
-              `LOOP ENFORCEMENT: You were warned about repeating "${currentPattern}" but continued. ` +
-              `Forcing sleep to prevent credit waste. On next wake, try a DIFFERENT approach.`,
-            source: "system",
-          };
-          loopWarningPattern = null;
-          lastToolPatterns = [];
-          db.setAgentState("sleeping");
-          onStateChange?.("sleeping");
-          running = false;
-          break;
-        }
-
-        // Check if the same pattern repeated MAX_REPETITIVE_TURNS times
-        if (
-          lastToolPatterns.length === MAX_REPETITIVE_TURNS &&
-          lastToolPatterns.every((p) => p === currentPattern)
-        ) {
-          log(config, `[LOOP] Repetitive pattern detected: ${currentPattern}`);
-          pendingInput = {
-            content:
-              `LOOP DETECTED: You have called "${currentPattern}" ${MAX_REPETITIVE_TURNS} times in a row with similar results. ` +
-              `STOP repeating yourself. You already know your status. DO SOMETHING DIFFERENT NOW. ` +
-              `Pick ONE concrete task from your genesis prompt and execute it.`,
-            source: "system",
-          };
-          loopWarningPattern = currentPattern;
-          lastToolPatterns = [];
-        }
-
         // Detect multi-tool maintenance loops: all tools in the turn are idle-only,
         // even if the specific combination varies across consecutive turns.
         const isAllIdleTools = turn.toolCalls.every((tc) => isIdleOnlyTool(tc.name));
-        if (isAllIdleTools) {
-          idleToolTurns++;
-          if (idleToolTurns >= MAX_REPETITIVE_TURNS && !pendingInput) {
-            log(config, `[LOOP] Maintenance loop detected: ${idleToolTurns} consecutive idle-only turns`);
-            pendingInput = {
-              content:
-                `MAINTENANCE LOOP DETECTED: Your last ${idleToolTurns} turns only used status-check tools ` +
-                `(${turn.toolCalls.map((tc) => tc.name).join(", ")}). ` +
-                `You already know your status. Review your genesis prompt and SOUL.md, then execute a CONCRETE task. ` +
-                `Write code, create a file, register a service, or build something new.`,
-              source: "system",
-            };
-            idleToolTurns = 0;
-          }
-        } else {
-          idleToolTurns = 0;
+        idleToolTurns = isAllIdleTools ? idleToolTurns + 1 : 0;
+        db.setKV(IDLE_TOOL_TURNS_KEY, String(idleToolTurns));
+
+        // Both detectors put the agent to sleep immediately (with backoff)
+        // instead of injecting a message: an injected message is one more
+        // paid turn, and it used to reset the idle counters.
+        if (idleToolTurns >= MAX_REPETITIVE_TURNS) {
+          db.setKV(
+            IDLE_SLEEP_NOTE_KEY,
+            `MAINTENANCE LOOP DETECTED before your last sleep: ${idleToolTurns} consecutive turns only used ` +
+              `status-check tools (${turn.toolCalls.map((tc) => tc.name).join(", ")}). ` +
+              `You already know your status. ` +
+              (standalone
+                ? standaloneEarningGuidance
+                : `Review your genesis prompt and SOUL.md, then execute a CONCRETE task. ` +
+                  `Write code, create a file, register a service, or build something new.`),
+          );
+          sleepWithBackoff(`[LOOP] Maintenance loop detected: ${idleToolTurns} consecutive idle-only turns.`);
+          break;
+        }
+
+        if (
+          lastToolPatterns.length === MAX_REPETITIVE_TURNS &&
+          lastToolPatterns.every((p) => p === currentSignature)
+        ) {
+          db.setKV(
+            IDLE_SLEEP_NOTE_KEY,
+            `LOOP DETECTED before your last sleep: you called "${currentPattern}" with the same arguments ${MAX_REPETITIVE_TURNS} times in a row. ` +
+              `Do not repeat it. Pick ONE concrete task from your genesis prompt and take a DIFFERENT approach.` +
+              (standalone ? ` ${standaloneEarningGuidance}` : ""),
+          );
+          lastToolPatterns = [];
+          sleepWithBackoff(`[LOOP] Repetitive pattern detected: ${currentPattern}.`);
+          break;
         }
       }
 
@@ -880,31 +722,14 @@ export async function runAgentLoop(
       // If this turn had no pending input and didn't do any real work
       // (no mutations — only read/check/list/info tools), count as idle.
       // Use a blocklist of mutating tools rather than an allowlist of safe ones.
-      const MUTATING_TOOLS = new Set([
-        "exec", "write_file", "edit_own_file", "transfer_credits", "topup_credits", "fund_child",
-        "spawn_child", "start_child", "delete_sandbox", "create_sandbox",
-        "install_npm_package", "install_mcp_server", "install_skill",
-        "create_skill", "remove_skill", "install_skill_from_git",
-        "install_skill_from_url", "pull_upstream", "git_commit", "git_push",
-        "git_branch", "git_clone", "send_message", "message_child",
-        "register_domain", "register_erc8004", "give_feedback",
-        "update_genesis_prompt", "update_agent_card", "modify_heartbeat",
-        "expose_port", "remove_port", "x402_fetch", "manage_dns",
-        "distress_signal", "prune_dead_children", "sleep",
-        "update_soul", "remember_fact", "set_goal", "complete_goal",
-        "save_procedure", "note_about_agent", "forget",
-        "enter_low_compute", "switch_model", "review_upstream_changes",
-      ]);
+      // System-injected inputs are not real input: they don't reset the count.
       const didMutate = turn.toolCalls.some((tc) => MUTATING_TOOLS.has(tc.name));
+      const hadRealInput = !!currentInput && currentInput.source !== "system";
 
-      if (!currentInput && !didMutate) {
+      if (!hadRealInput && !didMutate) {
         idleTurnCount++;
         if (idleTurnCount >= MAX_IDLE_TURNS) {
-          log(config, `[IDLE] ${idleTurnCount} consecutive idle turns with no work. Entering sleep.`);
-          db.setKV("sleep_until", new Date(Date.now() + 60_000).toISOString());
-          db.setAgentState("sleeping");
-          onStateChange?.("sleeping");
-          running = false;
+          sleepWithBackoff(`[IDLE] ${idleTurnCount} consecutive idle turns with no work.`);
         }
       } else {
         idleTurnCount = 0;
@@ -931,15 +756,8 @@ export async function runAgentLoop(
         response.finishReason === "stop"
       ) {
         // Agent produced text without tool calls.
-        // This is a natural pause point -- no work queued, sleep briefly.
-        log(config, "[IDLE] No pending inputs. Entering brief sleep.");
-        db.setKV(
-          "sleep_until",
-          new Date(Date.now() + 60_000).toISOString(),
-        );
-        db.setAgentState("sleeping");
-        onStateChange?.("sleeping");
-        running = false;
+        // This is a natural pause point -- no work queued.
+        sleepWithBackoff("[IDLE] No pending inputs.");
       }
 
       consecutiveErrors = 0;
@@ -981,6 +799,291 @@ export async function runAgentLoop(
   }
 
   log(config, `[LOOP END] Agent loop finished. State: ${db.getAgentState()}`);
+}
+
+// ─── Orchestration Runtime (one per process) ───────────────────
+
+export interface OrchestrationRuntime {
+  planModeController: PlanModeController;
+  orchestrator: Orchestrator;
+  workerPool: LocalWorkerPool;
+  /** Updated by the loop every turn; read by the planner as its budget. */
+  latestFinancial?: FinancialState;
+}
+
+// Keyed by database handle: one runtime per process (and per test database).
+const orchestrationRuntimes = new WeakMap<AutomatonDatabase, OrchestrationRuntime | null>();
+
+/** The runtime created for this database, if any (exposed for tests). */
+export function getOrchestrationRuntime(db: AutomatonDatabase): OrchestrationRuntime | undefined {
+  return orchestrationRuntimes.get(db) ?? undefined;
+}
+
+function getOrCreateOrchestrationRuntime(params: {
+  options: AgentLoopOptions;
+  standalone: boolean;
+  blockrunConfig: ReturnType<typeof resolveBlockRunConfig> | undefined;
+  tools: AutomatonTool[];
+  toolContext: ToolContext;
+}): OrchestrationRuntime | undefined {
+  const { options, standalone, blockrunConfig, tools, toolContext } = params;
+  const { identity, config, db, conway, policyEngine, spendTracker } = options;
+
+  if (orchestrationRuntimes.has(db)) {
+    return orchestrationRuntimes.get(db) ?? undefined;
+  }
+  if (!hasTable(db.raw, "goals")) {
+    return undefined;
+  }
+
+  let runtime: OrchestrationRuntime | null = null;
+  try {
+    // Local workers only live in this process: rows left over from a
+    // previous process can never be alive again.
+    const staleWorkers = markAllLocalWorkersDead(db.raw);
+    if (staleWorkers > 0) {
+      logger.info(`Marked ${staleWorkers} local worker(s) from a previous process as dead`);
+    }
+
+    const planModeController = new PlanModeController(db.raw);
+
+    let registry: ProviderRegistry;
+    if (blockrunConfig && options.blockrunFetch) {
+      // Standalone: orchestrator/workers use BlockRun, paid via the same
+      // guarded x402 fetch as the main loop (shared caps and reserve).
+      registry = ProviderRegistry.forBlockRun({
+        apiUrl: blockrunConfig.apiUrl,
+        models: {
+          reasoning: blockrunConfig.models.normal,
+          fast: blockrunConfig.models.lowCompute,
+          cheap: blockrunConfig.models.critical,
+        },
+        paidFetch: options.blockrunFetch,
+      });
+    } else {
+      // Bridge automaton config API keys to env vars for the provider registry.
+      // The registry reads keys from process.env; the automaton config may have
+      // them from config.json or Conway provisioning.
+      if (config.openaiApiKey && !process.env.OPENAI_API_KEY) {
+        process.env.OPENAI_API_KEY = config.openaiApiKey;
+      }
+      if (config.anthropicApiKey && !process.env.ANTHROPIC_API_KEY) {
+        process.env.ANTHROPIC_API_KEY = config.anthropicApiKey;
+      }
+      // Conway Compute API is OpenAI-compatible. Use it as fallback when no
+      // direct OpenAI key is available. The conwayApiKey is always present
+      // (required for sandbox operations), so this ensures the orchestrator
+      // can always make inference calls.
+      if (config.conwayApiKey && !process.env.CONWAY_API_KEY) {
+        process.env.CONWAY_API_KEY = config.conwayApiKey;
+      }
+      // If no OpenAI key is set but Conway key is available, use Conway as
+      // the OpenAI provider (Conway Compute is OpenAI API-compatible).
+      if (!process.env.OPENAI_API_KEY && config.conwayApiKey) {
+        process.env.OPENAI_API_KEY = config.conwayApiKey;
+        process.env.OPENAI_BASE_URL = `${config.conwayApiUrl}/v1`;
+      }
+
+      const providersPath = path.join(
+        process.env.HOME || process.cwd(),
+        ".automaton",
+        "inference-providers.json",
+      );
+      registry = ProviderRegistry.fromConfig(providersPath);
+
+      // If OPENAI_BASE_URL was set (Conway fallback), update the default
+      // provider's baseUrl so the OpenAI client points to Conway Compute.
+      if (process.env.OPENAI_BASE_URL) {
+        registry.overrideBaseUrl("openai", process.env.OPENAI_BASE_URL);
+      }
+    }
+
+    const unifiedInference = new UnifiedInferenceClient(registry);
+    const agentTracker = new SimpleAgentTracker(db);
+    const funding = new SimpleFundingProtocol(conway, identity, db);
+    const messaging = new ColonyMessaging(
+      new LocalDBTransport(db),
+      db,
+    );
+
+    const harnessRegistry = new HarnessRegistry();
+
+    // Adapter: local workers use the unified inference path so planner-backed
+    // harnesses can preserve tier + responseFormat contracts.
+    const workerInference = createWorkerInferenceBridge(unifiedInference);
+
+    // Local worker pool: runs inference-driven agents in-process
+    // as async tasks. Falls back from Conway sandbox spawning.
+    const initializedWorkerPool = new LocalWorkerPool({
+      db: db.raw,
+      inference: workerInference,
+      conway,
+      harnessRegistry,
+      identity,
+      config,
+      // Standalone: workers may only edit files under ~/work (the app
+      // directory is read-only and ~/.automaton holds the wallet/state).
+      allowedEditRoot: ensureStandaloneWorkDir(config) ?? process.cwd(),
+      tools,
+      toolContext,
+      policyEngine,
+      spendTracker,
+      // Standalone: one paid worker at a time.
+      maxConcurrent: standalone ? 1 : undefined,
+    });
+
+    const orchestrator: Orchestrator = new Orchestrator({
+      db: db.raw,
+      agentTracker,
+      funding,
+      messaging,
+      inference: unifiedInference,
+      identity,
+      isWorkerAlive: (address: string) => {
+        if (address.startsWith("local://")) {
+          return initializedWorkerPool.hasWorker(address);
+        }
+        // Remote workers: check children table
+        const child = db.raw.prepare(
+          "SELECT status FROM children WHERE sandbox_id = ? OR address = ?",
+        ).get(address, address) as { status: string } | undefined;
+        if (!child) return false;
+        return !["failed", "dead", "cleaned_up"].includes(child.status);
+      },
+      // Planner budget = the loop's real financial state (spendable USDC
+      // in standalone mode), not the parent's row in the children table.
+      getFinancialState: () => runtime?.latestFinancial,
+      config: {
+        ...config,
+        spawnAgent: async (task: any) => {
+          // Standalone: no sandboxes and no replication — in-process workers only.
+          if (standalone) {
+            // The task waits for the running worker to finish.
+            if (!initializedWorkerPool.hasCapacity() || initializedWorkerPool.isRunningTask(task.id)) {
+              return null;
+            }
+            try {
+              return initializedWorkerPool.spawn(task);
+            } catch (localError) {
+              logger.warn("Failed to spawn local worker", {
+                taskId: task.id,
+                error: localError instanceof Error ? localError.message : String(localError),
+              });
+              return null;
+            }
+          }
+
+          // Try Conway sandbox spawn first (production)
+          try {
+            const { generateGenesisConfig } = await import("../replication/genesis.js");
+            const { spawnChild } = await import("../replication/spawn.js");
+            const { ChildLifecycle } = await import("../replication/lifecycle.js");
+
+            const role = task.agentRole ?? "generalist";
+            const genesis = generateGenesisConfig(identity, config, {
+              name: `worker-${role}-${Date.now().toString(36)}`,
+              specialization: `${role}: ${task.title}`,
+            });
+
+            const lifecycle = new ChildLifecycle(db.raw);
+            const child = await spawnChild(conway, identity, db, genesis, lifecycle);
+
+            return {
+              address: child.address,
+              name: child.name,
+              sandboxId: child.sandboxId,
+            };
+          } catch (sandboxError: any) {
+            // If the error is a 402 (insufficient credits), attempt topup and retry once
+            const is402 = sandboxError?.status === 402 ||
+              sandboxError?.message?.includes("INSUFFICIENT_CREDITS");
+
+            if (is402) {
+              const SANDBOX_TOPUP_COOLDOWN_MS = 60_000;
+              const lastAttempt = db.getKV("last_sandbox_topup_attempt");
+              const cooldownExpired = !lastAttempt ||
+                Date.now() - new Date(lastAttempt).getTime() >= SANDBOX_TOPUP_COOLDOWN_MS;
+
+              if (cooldownExpired) {
+                db.setKV("last_sandbox_topup_attempt", new Date().toISOString());
+                try {
+                  const { topupForSandbox } = await import("../conway/topup.js");
+                  const topupResult = await topupForSandbox({
+                    apiUrl: config.conwayApiUrl,
+                    account: identity.account,
+                    error: sandboxError,
+                    chainType: config.chainType || identity.chainType || "evm",
+                  });
+
+                  if (topupResult?.success) {
+                    logger.info(`Sandbox topup succeeded ($${topupResult.amountUsd}), retrying spawn`, {
+                      taskId: task.id,
+                    });
+                    // Retry spawn once after successful topup
+                    try {
+                      const { generateGenesisConfig: genGenesis } = await import("../replication/genesis.js");
+                      const { spawnChild: retrySpawn } = await import("../replication/spawn.js");
+                      const { ChildLifecycle: RetryLifecycle } = await import("../replication/lifecycle.js");
+
+                      const retryRole = task.agentRole ?? "generalist";
+                      const retryGenesis = genGenesis(identity, config, {
+                        name: `worker-${retryRole}-${Date.now().toString(36)}`,
+                        specialization: `${retryRole}: ${task.title}`,
+                      });
+                      const retryLifecycle = new RetryLifecycle(db.raw);
+                      const child = await retrySpawn(conway, identity, db, retryGenesis, retryLifecycle);
+                      return {
+                        address: child.address,
+                        name: child.name,
+                        sandboxId: child.sandboxId,
+                      };
+                    } catch (retryError) {
+                      logger.warn("Spawn retry after topup failed", {
+                        taskId: task.id,
+                        error: retryError instanceof Error ? retryError.message : String(retryError),
+                      });
+                    }
+                  }
+                } catch (topupError) {
+                  logger.warn("Sandbox topup attempt failed", {
+                    taskId: task.id,
+                    error: topupError instanceof Error ? topupError.message : String(topupError),
+                  });
+                }
+              }
+            }
+
+            // Conway sandbox unavailable — fall back to local worker
+            logger.info("Conway sandbox unavailable, spawning local worker", {
+              taskId: task.id,
+              error: sandboxError instanceof Error ? sandboxError.message : String(sandboxError),
+            });
+
+            try {
+              const spawned = initializedWorkerPool.spawn(task);
+              return spawned;
+            } catch (localError) {
+              logger.warn("Failed to spawn local worker", {
+                taskId: task.id,
+                error: localError instanceof Error ? localError.message : String(localError),
+              });
+              return null;
+            }
+          }
+        },
+      },
+    });
+runtime = { planModeController, orchestrator, workerPool: initializedWorkerPool };
+  } catch (error) {
+    logger.warn(
+      `Orchestrator initialization failed, continuing without orchestration: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+    runtime = null;
+  }
+  orchestrationRuntimes.set(db, runtime);
+  return runtime ?? undefined;
 }
 
 // ─── Helpers ───────────────────────────────────────────────────

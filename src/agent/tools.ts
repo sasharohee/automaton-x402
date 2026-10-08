@@ -18,37 +18,64 @@ import type {
   PolicyRequest,
   InputSource,
   SpendTrackerInterface,
+  AutomatonDatabase,
 } from "../types.js";
 import { DEFAULT_TREASURY_POLICY } from "../types.js";
 import type { PolicyEngine } from "./policy-engine.js";
 import { sanitizeToolResult, sanitizeInput } from "./injection-defense.js";
 import { createLogger } from "../observability/logger.js";
+import { isStandalone } from "../conway/provider.js";
+import { resolveWriteRoots, type WriteRoots } from "./workdir.js";
 
 const logger = createLogger("tools");
 
 // ─── Path Confinement ─────────────────────────────────────────
-// write_file is restricted to the sandbox home directory tree.
-// The sandbox home is /root for both local and remote execution.
-const SANDBOX_HOME = "/root";
+// write_file is restricted to a single directory tree:
+//   - Conway mode: the sandbox home (/root), for local and remote execution.
+//   - Standalone mode: ~/work on the host (never ~/.automaton or the rest of HOME).
 
 /**
  * Validate that a file path resolves to within the allowed root directory.
  * Returns the resolved absolute path, or an error string if out of bounds.
  */
-function confinePathToSandbox(filePath: string): string | { error: string } {
-  // Resolve ~ to SANDBOX_HOME
+export function confinePathToSandbox(
+  filePath: string,
+  roots: WriteRoots = resolveWriteRoots(undefined),
+): string | { error: string } {
+  const { home, root } = roots;
+  // Resolve ~ to the home directory
   const expanded = filePath.startsWith("~")
-    ? nodePath.join(SANDBOX_HOME, filePath.slice(1))
+    ? nodePath.join(home, filePath.slice(1))
     : filePath;
-  // Resolve to absolute (relative paths resolve against SANDBOX_HOME)
-  const resolved = nodePath.resolve(SANDBOX_HOME, expanded);
-  // Ensure the resolved path is within the sandbox home
-  if (resolved !== SANDBOX_HOME && !resolved.startsWith(SANDBOX_HOME + "/")) {
+  // Resolve to absolute (relative paths resolve against the write root)
+  const resolved = nodePath.resolve(root, expanded);
+  // Ensure the resolved path is within the write root
+  if (resolved !== root && !resolved.startsWith(root + "/")) {
     return {
-      error: `Blocked: write_file path "${filePath}" resolves to "${resolved}" which is outside the allowed directory (${SANDBOX_HOME}). Writes are confined to the sandbox home.`,
+      error: `Blocked: write_file path "${filePath}" resolves to "${resolved}" which is outside the allowed directory (${root}). Writes are confined to ${root}.`,
     };
   }
   return resolved;
+}
+
+// ─── USDC Balance Cache (standalone) ──────────────────────────
+export const USDC_BALANCE_CACHE_KEY = "check_usdc_balance_cache";
+export const USDC_BALANCE_CACHE_TTL_MS = 5 * 60_000;
+
+function readUsdcBalanceCache(
+  db: Pick<AutomatonDatabase, "getKV">,
+): { balance: number; checkedAt: number } | null {
+  try {
+    const raw = db.getKV(USDC_BALANCE_CACHE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { balance?: unknown; checkedAt?: unknown };
+    if (typeof parsed.balance !== "number" || typeof parsed.checkedAt !== "number") return null;
+    const age = Date.now() - parsed.checkedAt;
+    if (age < 0 || age >= USDC_BALANCE_CACHE_TTL_MS) return null;
+    return { balance: parsed.balance, checkedAt: parsed.checkedAt };
+  } catch {
+    return null;
+  }
 }
 
 // Tools whose results come from external sources and need sanitization
@@ -160,7 +187,7 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
       execute: async (args, ctx) => {
         const filePath = args.path as string;
         // Path confinement: restrict writes to sandbox home directory
-        const confined = confinePathToSandbox(filePath);
+        const confined = confinePathToSandbox(filePath, resolveWriteRoots(ctx.config));
         if (typeof confined === "object") return confined.error;
         // Guard against overwriting protected files (same check as edit_own_file)
         const { isProtectedFile } = await import("../self-mod/code.js");
@@ -266,11 +293,24 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
       riskLevel: "safe",
       parameters: { type: "object", properties: {} },
       execute: async (_args, ctx) => {
-        const { getUsdcBalance } = await import("../conway/x402.js");
         const chainType = ctx.config.chainType || ctx.identity.chainType || "evm";
+        const networkLabel = chainType === "solana" ? "Solana" : "Base";
+        // Standalone: every turn costs real money, so repeated balance checks
+        // are served from a 5-minute cache instead of hitting the RPC again.
+        const standalone = isStandalone(ctx.config);
+        if (standalone) {
+          const cached = readUsdcBalanceCache(ctx.db);
+          if (cached) {
+            const ageSeconds = Math.round((Date.now() - cached.checkedAt) / 1000);
+            return `USDC balance: ${cached.balance.toFixed(6)} USDC on ${networkLabel} (cached ${ageSeconds}s ago, refreshed at most every 5 min — no need to check again)`;
+          }
+        }
+        const { getUsdcBalance } = await import("../conway/x402.js");
         const network = chainType === "solana" ? "solana:mainnet" : "eip155:8453";
         const balance = await getUsdcBalance(ctx.identity.address, network, chainType);
-        const networkLabel = chainType === "solana" ? "Solana" : "Base";
+        if (standalone) {
+          ctx.db.setKV(USDC_BALANCE_CACHE_KEY, JSON.stringify({ balance, checkedAt: Date.now() }));
+        }
         return `USDC balance: ${balance.toFixed(6)} USDC on ${networkLabel}`;
       },
     },

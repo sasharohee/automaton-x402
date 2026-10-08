@@ -63,6 +63,10 @@ export interface AutomatonConfig {
   agentId?: string;
   maxChildren: number;
   maxTurnsPerCycle?: number;
+  /** First idle sleep duration (seconds); doubles on each idle sleep. Default 300. */
+  idleSleepBaseSeconds?: number;
+  /** Cap for the idle sleep backoff (seconds). Default 3600. */
+  idleSleepMaxSeconds?: number;
   /** Child sandbox memory config (MB), default 1024 */
   childSandboxMemoryMb?: number;
   parentAddress?: string;
@@ -89,6 +93,18 @@ export interface AutomatonConfig {
    * review them. Disabled by default.
    */
   autoUpdate?: boolean;
+  /**
+   * Standalone only: an operator-managed tunnel publishes ONE local port of
+   * this machine at a public HTTPS URL. Absent = no inbound connectivity.
+   */
+  publicService?: PublicServiceConfig;
+}
+
+export interface PublicServiceConfig {
+  /** Public HTTPS URL served by the tunnel (e.g. https://xyz.ngrok-free.app). */
+  publicUrl: string;
+  /** Local port published by the tunnel (default 8787, 1024-65535). */
+  servicePort: number;
 }
 
 export type ProviderMode = "conway" | "standalone";

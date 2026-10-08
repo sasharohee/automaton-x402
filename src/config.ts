@@ -13,6 +13,7 @@ import type {
   SoulConfig,
   ProviderMode,
   BlockRunConfig,
+  PublicServiceConfig,
 } from "./types.js";
 import {
   DEFAULT_CONFIG,
@@ -32,6 +33,44 @@ const CONFIG_FILENAME = "automaton.json";
 
 export function getConfigPath(): string {
   return path.join(getAutomatonDir(), CONFIG_FILENAME);
+}
+
+export const DEFAULT_PUBLIC_SERVICE_PORT = 8787;
+
+/**
+ * Validate the optional `publicService` block (standalone only).
+ * `publicUrl` must be an https:// URL, `servicePort` an integer in
+ * 1024-65535 (default 8787). An invalid block is ignored with a warning,
+ * which keeps the safe "no inbound connectivity" behaviour.
+ */
+export function parsePublicServiceConfig(raw: unknown): PublicServiceConfig | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== "object" || Array.isArray(raw)) {
+    logger.warn("Invalid publicService config (not an object), ignoring it");
+    return undefined;
+  }
+  const { publicUrl, servicePort } = raw as Record<string, unknown>;
+
+  let url: URL;
+  try {
+    if (typeof publicUrl !== "string") throw new Error("missing");
+    url = new URL(publicUrl.trim());
+  } catch {
+    logger.warn(`Invalid publicService.publicUrl: ${String(publicUrl)}, ignoring publicService`);
+    return undefined;
+  }
+  if (url.protocol !== "https:" || !url.hostname || url.username || url.password) {
+    logger.warn(`publicService.publicUrl must be an https:// URL: ${String(publicUrl)}, ignoring publicService`);
+    return undefined;
+  }
+
+  const port = servicePort === undefined ? DEFAULT_PUBLIC_SERVICE_PORT : servicePort;
+  if (typeof port !== "number" || !Number.isInteger(port) || port < 1024 || port > 65535) {
+    logger.warn(`publicService.servicePort must be an integer in 1024-65535: ${String(servicePort)}, ignoring publicService`);
+    return undefined;
+  }
+
+  return { publicUrl: url.toString().replace(/\/+$/, ""), servicePort: port };
 }
 
 /**
@@ -123,6 +162,8 @@ export function loadConfig(): AutomatonConfig | null {
       // Standalone: replication is not available.
       maxChildren: standalone ? 0 : (raw.maxChildren ?? DEFAULT_CONFIG.maxChildren),
       autoUpdate: raw.autoUpdate === true,
+      // Only meaningful (and only read) in standalone mode.
+      publicService: standalone ? parsePublicServiceConfig(raw.publicService) : undefined,
     } as AutomatonConfig;
   } catch {
     return null;
