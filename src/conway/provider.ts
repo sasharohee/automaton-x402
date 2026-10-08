@@ -27,6 +27,7 @@ import { createStandaloneClient } from "./standalone-client.js";
 import { createX402Fetch, PaymentLedger } from "./x402-v2.js";
 import { getUsdcBalanceDetailed } from "./x402.js";
 import { SpendGuard } from "../survival/spend-guard.js";
+import { resolveModelEscalation } from "../inference/model-escalation.js";
 
 export function isStandalone(config: Pick<AutomatonConfig, "providerMode"> | undefined | null): boolean {
   return config?.providerMode === "standalone";
@@ -44,7 +45,11 @@ export function resolveBlockRunConfig(config: Pick<AutomatonConfig, "blockrun">)
     ...DEFAULT_BLOCKRUN_CONFIG.models,
     ...(config.blockrun?.models ?? {}),
   };
-  return { apiUrl: apiUrl.replace(/\/$/, ""), models };
+  return {
+    apiUrl: apiUrl.replace(/\/$/, ""),
+    models,
+    escalation: resolveModelEscalation(config.blockrun?.escalation),
+  };
 }
 
 /**

@@ -96,6 +96,23 @@ Equivalent `~/.automaton/automaton.json` excerpt:
 3. Compare the per-token price with your caps. Each call is paid separately and must stay under `maxX402PaymentCents` ($0.10 by default), and everything counts against `maxTotalDailySpendCents` ($2/day). A frontier model with a long context can exceed $0.10 per call: raise `maxX402PaymentCents` or pick a cheaper model, otherwise every call will be refused before signing.
 4. A common setup: a strong model for `high`, a mid-priced one for `normal`, `deepseek-chat` for `lowCompute` / `critical`. The agent moves down the tiers automatically as its balance shrinks.
 
+#### Difficulty-based escalation (`blockrun.escalation`)
+
+Alternatively, keep every tier on `deepseek-chat` and let hard work escalate to a stronger model:
+
+```json
+"blockrun": {
+  "escalation": { "model": "deepseek/deepseek-v4-pro", "maxCallsPerHour": 6 }
+}
+```
+
+These are the defaults, so the block is optional. In tiers `high` and `normal` only, a call uses the escalation model when:
+- it is a planner call (orchestrator `planGoal` / `replanAfterFailure`);
+- the previous turn wrote a source file (`.ts`, `.js`, `.py`, `.sh`, `.json`, `.sql`, …, not notes or markdown), or ran a build/test/run command (`npm`, `node`, `tsc`, `python`, …) that exited non-zero;
+- the agent called `think_hard({ reason })` (next turn only).
+
+At most `maxCallsPerHour` escalated calls per UTC clock hour; the count is stored in the database, so a restart does not reset it. Beyond that, the tier model is used until the next hour. Workers never escalate. Escalated calls go through the same x402 spend guard and caps as every other call. Set `maxCallsPerHour` to `0` to disable escalation.
+
 ### Environment variables
 
 | Variable | Purpose |

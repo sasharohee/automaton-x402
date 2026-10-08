@@ -100,12 +100,14 @@ export function registerMappedModels(
   registry: Pick<ModelRegistry, "get" | "upsert">,
   map: ModelTierMap,
   provider: ModelProvider = "blockrun",
+  escalationModel?: string,
 ): void {
   const now = new Date().toISOString();
+  // The escalation model is only used in tiers high/normal.
   const tierFor = (id: string): SurvivalTier =>
     id === map.critical ? "critical" : id === map.lowCompute ? "low_compute" : "normal";
 
-  for (const modelId of unique([map.high, map.normal, map.lowCompute, map.critical])) {
+  for (const modelId of unique([map.high, map.normal, map.lowCompute, map.critical, escalationModel])) {
     const existing = registry.get(modelId);
     const entry: ModelEntry = {
       modelId,

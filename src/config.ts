@@ -26,6 +26,7 @@ import {
 import { getAutomatonDir } from "./identity/wallet.js";
 import { loadApiKeyFromConfig } from "./identity/provision.js";
 import { createLogger } from "./observability/logger.js";
+import { resolveModelEscalation } from "./inference/model-escalation.js";
 import type { ChainType } from "./identity/chain.js";
 
 const logger = createLogger("config");
@@ -116,6 +117,7 @@ export function loadConfig(): AutomatonConfig | null {
       ? {
           apiUrl: raw.blockrun?.apiUrl || DEFAULT_BLOCKRUN_CONFIG.apiUrl,
           models: { ...DEFAULT_BLOCKRUN_CONFIG.models, ...(raw.blockrun?.models ?? {}) },
+          escalation: resolveModelEscalation(raw.blockrun?.escalation),
         }
       : raw.blockrun;
 

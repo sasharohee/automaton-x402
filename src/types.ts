@@ -121,10 +121,27 @@ export interface ModelTierMap {
   critical: string;
 }
 
+/**
+ * Difficulty-based escalation: hard work (planning, non-trivial coding,
+ * explicit think_hard) uses `model` instead of the tier model, at most
+ * `maxCallsPerHour` times per UTC clock hour, in tiers high/normal only.
+ */
+export interface ModelEscalationConfig {
+  model: string;
+  maxCallsPerHour: number;
+}
+
+export const DEFAULT_MODEL_ESCALATION: ModelEscalationConfig = {
+  model: "deepseek/deepseek-v4-pro",
+  maxCallsPerHour: 6,
+};
+
 export interface BlockRunConfig {
   /** Base URL; `/v1/chat/completions` and `/v1/models` are appended. */
   apiUrl: string;
   models: ModelTierMap;
+  /** Escalation model for hard work. Defaults to DEFAULT_MODEL_ESCALATION. */
+  escalation?: ModelEscalationConfig;
 }
 
 export const DEFAULT_BLOCKRUN_CONFIG: BlockRunConfig = {
@@ -134,6 +151,7 @@ export const DEFAULT_BLOCKRUN_CONFIG: BlockRunConfig = {
     lowCompute: "deepseek-chat",
     critical: "deepseek-chat",
   },
+  escalation: DEFAULT_MODEL_ESCALATION,
 };
 
 export const DEFAULT_CONFIG: Partial<AutomatonConfig> = {
@@ -1313,6 +1331,8 @@ export interface InferenceRequest {
   turnId?: string;
   maxTokens?: number; // override
   tools?: unknown[];
+  /** Use this registry model instead of the routing-matrix choice (escalation). */
+  modelOverride?: string;
 }
 
 export interface InferenceResult {

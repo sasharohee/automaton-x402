@@ -255,7 +255,8 @@ export class ProviderRegistry {
    */
   static forBlockRun(params: {
     apiUrl: string;
-    models: { reasoning: string; fast: string; cheap: string };
+    /** `escalation` is only reachable via chatDirect (planner escalation). */
+    models: { reasoning: string; fast: string; cheap: string; escalation?: string };
     paidFetch: typeof fetch;
   }): ProviderRegistry {
     const model = (id: string, tier: ModelTier): ModelConfig => ({
@@ -278,6 +279,8 @@ export class ProviderRegistry {
         model(params.models.reasoning, "reasoning"),
         model(params.models.fast, "fast"),
         model(params.models.cheap, "cheap"),
+        // Listed last so tier resolution still picks the tier models first.
+        ...(params.models.escalation ? [model(params.models.escalation, "reasoning")] : []),
       ],
       maxRequestsPerMinute: 60,
       maxTokensPerMinute: 200_000,

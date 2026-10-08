@@ -20,6 +20,7 @@ import {
   goalToPlannerInput,
   planGoal,
   replanAfterFailure,
+  type PlannerInferenceClient,
   type PlannerOutput,
   type PlannedTask,
   taskToPlannerFailureInput,
@@ -114,6 +115,11 @@ export class Orchestrator {
      * spendable USDC in standalone mode). Used as the planner budget.
      */
     getFinancialState?: () => { creditsCents: number; usdcBalance: number } | undefined;
+    /**
+     * Client for planGoal / replanAfterFailure (e.g. one that escalates the
+     * planner to the stronger model). Defaults to `inference`.
+     */
+    plannerInference?: PlannerInferenceClient;
   }) {}
 
   async tick(): Promise<OrchestratorTickResult> {
@@ -430,7 +436,7 @@ export class Orchestrator {
           standalone: this.isStandalone(),
           publicService: getPublicService(this.params.config),
         }),
-        this.params.inference,
+        this.params.plannerInference ?? this.params.inference,
       );
     } catch (error) {
       const err = normalizeError(error);
@@ -777,7 +783,7 @@ export class Orchestrator {
           standalone: this.isStandalone(),
           publicService: getPublicService(this.params.config),
         }),
-        this.params.inference,
+        this.params.plannerInference ?? this.params.inference,
       );
     } catch (error) {
       // Never fall back to re-running the goal as a single task: that is the

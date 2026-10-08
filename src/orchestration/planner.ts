@@ -1,5 +1,5 @@
 import type { Goal, TaskNode } from "./task-graph.js";
-import { UnifiedInferenceClient } from "../inference/inference-client.js";
+import type { UnifiedInferenceClient } from "../inference/inference-client.js";
 import type { ModelTier } from "../inference/provider-registry.js";
 import {
   buildStandalonePlannerNotice,
@@ -88,10 +88,13 @@ export interface PlannerFailureInput {
 
 const MODEL_TIERS: readonly ModelTier[] = ["reasoning", "fast", "cheap"];
 
+/** Only `chat` is used, so the orchestrator can pass an escalating wrapper. */
+export type PlannerInferenceClient = Pick<UnifiedInferenceClient, "chat">;
+
 export async function planGoal(
   goal: PlannerGoalInput,
   context: PlannerContext,
-  inference: UnifiedInferenceClient,
+  inference: PlannerInferenceClient,
 ): Promise<PlannerOutput> {
   return runPlannerInference({
     mode: "plan_goal",
@@ -105,7 +108,7 @@ export async function replanAfterFailure(
   goal: PlannerGoalInput,
   failedTask: PlannerFailureInput,
   context: PlannerContext,
-  inference: UnifiedInferenceClient,
+  inference: PlannerInferenceClient,
 ): Promise<PlannerOutput> {
   return runPlannerInference({
     mode: "replan_after_failure",
@@ -135,7 +138,7 @@ async function runPlannerInference(params: {
   goal: PlannerGoalInput;
   failedTask?: PlannerFailureInput;
   context: PlannerContext;
-  inference: UnifiedInferenceClient;
+  inference: PlannerInferenceClient;
 }): Promise<PlannerOutput> {
   const standalone = params.context.standalone === true;
   const basePrompt = buildPlannerPrompt(params.context);
