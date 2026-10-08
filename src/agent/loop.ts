@@ -65,6 +65,7 @@ import { createWorkerInferenceBridge } from "./worker-inference-bridge.js";
 import { ProviderRegistry } from "../inference/provider-registry.js";
 import { UnifiedInferenceClient } from "../inference/inference-client.js";
 import { isIdleOnlyTool } from "./idle-only-tools.js";
+import { turnSignature } from "./loop-detector.js";
 import { isStandalone, filterToolsForProvider, resolveBlockRunConfig } from "../conway/provider.js";
 import { buildRoutingMatrix, registerMappedModels } from "../inference/model-map.js";
 import { scheduleIdleSleep, resetIdleBackoff } from "./idle-backoff.js";
@@ -648,7 +649,12 @@ export async function runAgentLoop(
           .map((tc) => tc.name)
           .sort()
           .join(",");
-        lastToolPatterns.push(currentPattern);
+        // Repetition = same tools with the same arguments (or status checks
+        // only). Different exec commands in a row are normal work.
+        const currentSignature = turnSignature(
+          turn.toolCalls.map((tc) => ({ name: tc.name, args: JSON.stringify(tc.arguments ?? {}) })),
+        );
+        lastToolPatterns.push(currentSignature);
 
         // Keep only the last MAX_REPETITIVE_TURNS entries
         if (lastToolPatterns.length > MAX_REPETITIVE_TURNS) {
@@ -681,11 +687,11 @@ export async function runAgentLoop(
 
         if (
           lastToolPatterns.length === MAX_REPETITIVE_TURNS &&
-          lastToolPatterns.every((p) => p === currentPattern)
+          lastToolPatterns.every((p) => p === currentSignature)
         ) {
           db.setKV(
             IDLE_SLEEP_NOTE_KEY,
-            `LOOP DETECTED before your last sleep: you called "${currentPattern}" ${MAX_REPETITIVE_TURNS} times in a row. ` +
+            `LOOP DETECTED before your last sleep: you called "${currentPattern}" with the same arguments ${MAX_REPETITIVE_TURNS} times in a row. ` +
               `Do not repeat it. Pick ONE concrete task from your genesis prompt and take a DIFFERENT approach.` +
               (standalone ? ` ${STANDALONE_EARNING_GUIDANCE}` : ""),
           );
@@ -920,6 +926,8 @@ function getOrCreateOrchestrationRuntime(params: {
       toolContext,
       policyEngine,
       spendTracker,
+      // Standalone: one paid worker at a time.
+      maxConcurrent: standalone ? 1 : undefined,
     });
 
     const orchestrator: Orchestrator = new Orchestrator({
@@ -948,6 +956,10 @@ function getOrCreateOrchestrationRuntime(params: {
         spawnAgent: async (task: any) => {
           // Standalone: no sandboxes and no replication — in-process workers only.
           if (standalone) {
+            // The task waits for the running worker to finish.
+            if (!initializedWorkerPool.hasCapacity() || initializedWorkerPool.isRunningTask(task.id)) {
+              return null;
+            }
             try {
               return initializedWorkerPool.spawn(task);
             } catch (localError) {

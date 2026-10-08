@@ -25,6 +25,7 @@ import { getActiveSkillInstructions } from "../skills/loader.js";
 import { getLineageSummary } from "../replication/lineage.js";
 import { sanitizeInput } from "./injection-defense.js";
 import { loadCurrentSoul } from "../soul/model.js";
+import { STANDALONE_MODE_NOTICE } from "./standalone-notice.js";
 
 function getCoreRules(chainType?: string): string {
   const usdcNetwork = chainType === "solana" ? "USDC on Solana" : "USDC on Base";
@@ -552,31 +553,6 @@ export function getOrchestratorStatus(db: Database.Database): string {
 /**
  * Build the complete system prompt for a turn.
  */
-const STANDALONE_MODE_NOTICE = `--- PROVIDER: STANDALONE (no Conway) ---
-This runtime does NOT use Conway Cloud. Statements above about Conway sandboxes,
-Conway credits, domains or child agents do not apply here:
-- Commands and files run directly on your host machine.
-- Your thinking (inference) is bought per call from BlockRun with USDC from your own
-  wallet on Base, via x402 payments. Every call costs real money.
-- "Credits" means your spendable USDC: on-chain balance minus a protected reserve.
-- Spending is capped per request and per day; the reserve can never be spent.
-- Sandboxes, ports, domains, credit transfers and replication are unavailable.
-- To get more funds, ask your creator to send USDC on Base to your address.
-- You have NO inbound connectivity: no public IP, no open port, no domain. A server
-  you start is only reachable from localhost on your own machine. Nobody can call it
-  or pay you through it. Do not build one to earn money, and never claim that a
-  service is "live" or "online".
-- Earn money only through OUTBOUND requests: find paid bounties or tasks on the web
-  that you can complete and deliver over outbound HTTP requests, and use the tools
-  you already have. You have no ETH: do not attempt on-chain transactions that need
-  gas (e.g. register_erc8004).
-- Every turn costs real money. Your balance is already in this prompt: do not check
-  it again and again. If you have nothing concrete to do, call sleep with a long
-  duration (30 minutes or more).
-- File writes (write_file, workers) are confined to ~/work. ~/.automaton and the
-  application directory are off limits.
---- END PROVIDER ---`;
-
 export function buildSystemPrompt(params: {
   identity: AutomatonIdentity;
   config: AutomatonConfig;

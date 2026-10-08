@@ -44,14 +44,45 @@ interface LocalWorkerConfig {
   policyEngine?: PolicyEngine;
   spendTracker?: SpendTrackerInterface;
   inputSource?: InputSource;
+  /** Maximum number of workers running at once (unlimited when undefined). */
+  maxConcurrent?: number;
 }
 
 export class LocalWorkerPool {
-  private activeWorkers = new Map<string, { promise: Promise<void>; abortController: AbortController }>();
+  private activeWorkers = new Map<string, {
+    promise: Promise<void>;
+    abortController: AbortController;
+    taskId: string;
+  }>();
 
   constructor(private readonly config: LocalWorkerConfig) {}
 
+  /** True when another worker can be started (see maxConcurrent). */
+  hasCapacity(): boolean {
+    const max = this.config.maxConcurrent;
+    return max === undefined || this.activeWorkers.size < max;
+  }
+
+  /** True when a live worker is already executing this task. */
+  isRunningTask(taskId: string): boolean {
+    for (const worker of this.activeWorkers.values()) {
+      if (worker.taskId === taskId) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   spawn(task: TaskNode): { address: string; name: string; sandboxId: string } {
+    if (this.isRunningTask(task.id)) {
+      throw new Error(`A local worker is already running task ${task.id}`);
+    }
+    if (!this.hasCapacity()) {
+      throw new Error(
+        `Local worker limit reached (${this.activeWorkers.size}/${this.config.maxConcurrent})`,
+      );
+    }
+
     const workerId = `local-worker-${ulid()}`;
     const workerName = `worker-${task.agentRole ?? "generalist"}-${workerId.slice(-6)}`;
     const address = `local://${workerId}`;
@@ -88,7 +119,7 @@ export class LocalWorkerPool {
         }
       });
 
-    this.activeWorkers.set(workerId, { promise: workerPromise, abortController });
+    this.activeWorkers.set(workerId, { promise: workerPromise, abortController, taskId: task.id });
     return { address, name: workerName, sandboxId: workerId };
   }
 

@@ -20,6 +20,8 @@ export interface PlannerContextOptions {
   idleAgents?: number;
   busyAgents?: number;
   maxAgents?: number;
+  /** Standalone mode (no Conway): the planner gets the runtime's constraints. */
+  standalone?: boolean;
 }
 
 export const DEFAULT_PLANNER_AVAILABLE_ROLES = [
@@ -59,6 +61,7 @@ export async function buildPlannerContext(options: PlannerContextOptions): Promi
     busyAgents: clampCount(options.busyAgents),
     maxAgents: Math.max(1, clampCount(options.maxAgents, 1)),
     workspaceFiles: listWorkspaceFiles(options.workspace),
+    ...(options.standalone ? { standalone: true } : {}),
   };
 }
 

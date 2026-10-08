@@ -1,6 +1,7 @@
 import type { Database } from "better-sqlite3";
 import { ulid } from "ulid";
 import type { AutomatonIdentity } from "../types.js";
+import { isStandalone } from "../conway/provider.js";
 import { createLogger } from "../observability/logger.js";
 import {
   assignTask,
@@ -50,6 +51,8 @@ const ORCHESTRATOR_STATE_KEY = "orchestrator.state";
 const ORCHESTRATOR_TODO_KEY = "orchestrator.todo_md";
 const DEFAULT_TASK_FUNDING_CENTS = 25;
 const DEFAULT_MAX_REPLANS = 3;
+/** Standalone: each replan is paid with real USDC, so only one by default. */
+const STANDALONE_DEFAULT_MAX_REPLANS = 1;
 
 type ExecutionPhase =
   | "idle"
@@ -226,6 +229,13 @@ export class Orchestrator {
     const spawned = await this.trySpawnAgent(task);
     if (spawned) {
       return spawned;
+    }
+
+    // Standalone: tasks run only on local workers, one at a time. When none
+    // can be started the task waits; it is never self-assigned to the parent
+    // (that would run the parent's turns in parallel with the worker).
+    if (this.isStandalone()) {
+      throw new Error(`No available agent for task ${task.id} (local worker busy)`);
     }
 
     const reassigned = this.findBusyAgentForReassign();
@@ -416,11 +426,17 @@ export class Orchestrator {
           idleAgents: this.params.agentTracker.getIdle().length,
           busyAgents: Math.max(0, this.getActiveAgentCount() - this.params.agentTracker.getIdle().length),
           maxAgents: Number(this.params.config?.maxChildren ?? 3),
+          standalone: this.isStandalone(),
         }),
         this.params.inference,
       );
     } catch (error) {
       const err = normalizeError(error);
+      if (this.isStandalone()) {
+        // Standalone: running the raw goal as one task after the planner gave
+        // up only pays a worker for a goal nobody could decompose.
+        return this.failGoal(state, goal.id, `Planner failed: ${err.message}`);
+      }
       logger.warn("Planner inference failed, falling back to single-task plan", {
         goalId: goal.id,
         error: err.message,
@@ -442,6 +458,12 @@ export class Orchestrator {
         estimatedTotalCostCents: 200,
         estimatedTimeMinutes: 30,
       };
+    }
+
+    if (output.tasks.length === 0 && this.isStandalone()) {
+      // Standalone: an empty plan means the goal is infeasible here (e.g. it
+      // needs inbound connectivity).
+      return this.failGoal(state, goal.id, `Planner found the goal infeasible: ${output.analysis}`);
     }
 
     if (output.tasks.length === 0) {
@@ -575,6 +597,19 @@ export class Orchestrator {
       .filter((task) => task.goalId === goal.id);
 
     for (const task of ready) {
+      // A task that already used all its attempts never runs again, even if
+      // something put it back to pending.
+      if (task.metadata.retryCount >= task.metadata.maxRetries) {
+        logger.warn("Task exhausted its retries, failing instead of re-assigning", {
+          taskId: task.id,
+          retryCount: task.metadata.retryCount,
+          maxRetries: task.metadata.maxRetries,
+        });
+        failTask(this.params.db, task.id, "Retries exhausted", false);
+        counters.tasksFailed += 1;
+        continue;
+      }
+
       try {
         const assignment = await this.matchTaskToAgent(task);
         assignTask(this.params.db, task.id, assignment.agentAddress);
@@ -735,57 +770,28 @@ export class Orchestrator {
           idleAgents: this.params.agentTracker.getIdle().length,
           busyAgents: Math.max(0, this.getActiveAgentCount() - this.params.agentTracker.getIdle().length),
           maxAgents: Number(this.params.config?.maxChildren ?? 3),
+          standalone: this.isStandalone(),
         }),
         this.params.inference,
       );
     } catch (error) {
+      // Never fall back to re-running the goal as a single task: that is the
+      // task that just failed. The goal fails and the orchestrator goes idle.
       const err = normalizeError(error);
-      logger.warn("Replanner inference failed, falling back to single-task plan", {
-        goalId: goal.id,
-        error: err.message,
-      });
-      output = {
-        analysis: `Replanner fallback: ${err.message}`,
-        strategy: "Re-execute goal as a single generalist task",
-        customRoles: [],
-        tasks: [{
-          title: goal.title,
-          description: goal.description,
-          agentRole: "generalist",
-          dependencies: [],
-          estimatedCostCents: 200,
-          priority: 50,
-          timeoutMs: 300_000,
-        }],
-        risks: ["Replanner unavailable — re-executing without decomposition"],
-        estimatedTotalCostCents: 200,
-        estimatedTimeMinutes: 30,
-      };
+      return this.failGoal(state, goal.id, `Replanner failed: ${err.message}`);
     }
 
     if (output.tasks.length === 0) {
-      logger.warn("Replanner returned no tasks, falling back to single-task plan", { goalId: goal.id });
-      output = {
-        ...output,
-        tasks: [{
-          title: goal.title,
-          description: goal.description,
-          agentRole: "generalist",
-          dependencies: [],
-          estimatedCostCents: 200,
-          priority: 50,
-          timeoutMs: 300_000,
-        }],
-      };
+      return this.failGoal(state, goal.id, `Replanner returned no tasks: ${output.analysis}`);
     }
 
+    // The new plan replaces the failed work. Failed tasks (retries exhausted)
+    // and the tasks they blocked are cancelled, never reset to pending: a task
+    // at max_retries must not run again.
     this.params.db.prepare(
       `UPDATE task_graph
-       SET status = 'pending',
-           assigned_to = NULL,
-           started_at = NULL,
-           completed_at = NULL,
-           result = NULL
+       SET status = 'cancelled',
+           assigned_to = NULL
        WHERE goal_id = ?
          AND status IN ('failed', 'blocked')`,
     ).run(goal.id);
@@ -828,6 +834,26 @@ export class Orchestrator {
 
     // Reset to idle so the orchestrator can pick up other active goals
     // instead of being stuck in "failed" forever.
+    return { ...DEFAULT_STATE };
+  }
+
+  /**
+   * Terminal failure of a goal: no fallback task is created, open tasks are
+   * cancelled, and the orchestrator goes back to idle for other goals.
+   */
+  private failGoal(state: OrchestratorState, goalId: string, reason: string): OrchestratorState {
+    logger.warn("Goal failed, no fallback task created", {
+      goalId,
+      reason,
+      replanCount: state.replanCount,
+    });
+    this.params.db.prepare(
+      `UPDATE task_graph
+       SET status = 'cancelled', assigned_to = NULL
+       WHERE goal_id = ?
+         AND status IN ('pending', 'blocked')`,
+    ).run(goalId);
+    updateGoalStatus(this.params.db, goalId, "failed");
     return { ...DEFAULT_STATE };
   }
 
@@ -1060,10 +1086,15 @@ export class Orchestrator {
     return row?.count ?? 0;
   }
 
+  private isStandalone(): boolean {
+    return isStandalone(this.params.config);
+  }
+
   private getMaxReplans(): number {
-    const configured = Number(this.params.config?.maxReplans ?? DEFAULT_MAX_REPLANS);
+    const fallback = this.isStandalone() ? STANDALONE_DEFAULT_MAX_REPLANS : DEFAULT_MAX_REPLANS;
+    const configured = Number(this.params.config?.maxReplans ?? fallback);
     if (!Number.isFinite(configured)) {
-      return DEFAULT_MAX_REPLANS;
+      return fallback;
     }
 
     return Math.max(0, Math.floor(configured));

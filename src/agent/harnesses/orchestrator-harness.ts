@@ -22,6 +22,7 @@ import {
 } from "../../orchestration/task-graph.js";
 import { BaseHarness } from "./base-harness.js";
 import type { HarnessTool } from "../harness-types.js";
+import { isStandalone } from "../../conway/provider.js";
 
 const MAX_FIX_CYCLES = 3;
 
@@ -53,7 +54,7 @@ export class OrchestratorHarness extends BaseHarness {
     }
 
     this.messages = [
-      { role: "system", content: this.buildSystemPrompt() },
+      { role: "system", content: this.composeSystemPrompt() },
       { role: "user", content: this.buildTaskPrompt() },
     ];
   }
@@ -405,6 +406,7 @@ You follow a strict planner-backed plan → execute → verify → fix cycle:
       idleAgents: 0,
       busyAgents: Math.max(1, this.getManagedTasks().filter((task) => task.status === "assigned" || task.status === "running").length),
       maxAgents: Math.max(1, Number(this.context.config?.maxChildren ?? this.getManagedTasks().length ?? 1)),
+      standalone: isStandalone(this.context.config),
     });
 
     const explicitFailedTask = params.failedTaskId

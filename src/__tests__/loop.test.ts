@@ -768,10 +768,12 @@ describe("Agent Loop", () => {
       onTurnComplete: (turn) => turns.push(turn),
     });
 
+    // read_file is not an idle-only tool, and reading three different files
+    // (different arguments) is not a repetition: no loop detector fires and
+    // all four turns run.
     const note = db.getKV("loop.idle_sleep_note");
-    expect(note).toBeDefined();
-    expect(note).not.toContain("MAINTENANCE LOOP DETECTED");
-    expect(note).toContain("LOOP DETECTED");
+    expect(note ?? "").not.toContain("LOOP DETECTED");
+    expect(turns.length).toBe(4);
   });
 
   it("sleeps early when delegated work is active and no self-assigned parent task remains", async () => {
