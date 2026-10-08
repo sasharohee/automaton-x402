@@ -76,7 +76,9 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
         address: taskCtx.identity.address,
         creditsCents: credits,
         fundingHint:
-          "Use credit transfer API from a creator runtime to top this wallet up.",
+          taskCtx.config.providerMode === "standalone"
+            ? `Send USDC on Base (chain 8453) to ${taskCtx.identity.address}.`
+            : "Use credit transfer API from a creator runtime to top this wallet up.",
         timestamp: new Date().toISOString(),
       };
       taskCtx.db.setKV("last_distress", JSON.stringify(distressPayload));
@@ -155,6 +157,12 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
       credits,
       timestamp: new Date().toISOString(),
     }));
+
+    // Standalone mode: there are no Conway credits to buy — the USDC balance
+    // itself is the survival budget.
+    if (taskCtx.config.providerMode === "standalone") {
+      return { shouldWake: false };
+    }
 
     const MIN_TOPUP_USD = 5;
     if (balance >= MIN_TOPUP_USD && (ctx.survivalTier === "critical" || ctx.survivalTier === "dead")) {
@@ -274,6 +282,10 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
   },
 
   check_for_updates: async (_ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
+    // Auto-update is disabled unless explicitly enabled in automaton.json.
+    if (taskCtx.config.autoUpdate !== true) {
+      return { shouldWake: false };
+    }
     try {
       const { checkUpstream, getRepoInfo } = await import("../self-mod/upstream.js");
       const repo = getRepoInfo();

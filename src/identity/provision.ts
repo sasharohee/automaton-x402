@@ -65,6 +65,11 @@ export async function provision(
   apiUrl?: string,
   solanaIdentity?: ChainIdentity,
 ): Promise<ProvisionResult> {
+  // Standalone mode never contacts Conway (no account, no API key).
+  if (process.env.AUTOMATON_PROVIDER_MODE === "standalone") {
+    throw new Error("Conway provisioning is disabled in standalone mode.");
+  }
+
   const url = apiUrl || process.env.CONWAY_API_URL || DEFAULT_API_URL;
 
   // 1. Load wallet

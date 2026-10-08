@@ -11,6 +11,64 @@ import { gitInit, gitCommit, gitStatus, gitLog } from "./tools.js";
 
 const AUTOMATON_DIR = "~/.automaton";
 
+/**
+ * Files that must never be committed to the state repo: the wallet private
+ * key, API keys (automaton.json holds conwayApiKey / openaiApiKey /
+ * anthropicApiKey), databases and logs. See upstream PR #413.
+ */
+export const SENSITIVE_STATE_FILES = [
+  "wallet.json",
+  "wallet*.json",
+  "config.json",
+  "automaton.json",
+  "inference-providers.json",
+  ".env",
+  ".env.*",
+  "*.key",
+  "*.pem",
+  "state.db",
+  "state.db-wal",
+  "state.db-shm",
+  "logs/",
+  "*.log",
+  "*.err",
+] as const;
+
+export function buildStateGitignore(): string {
+  return `# Sensitive files - never commit (private key, API keys, databases)\n${SENSITIVE_STATE_FILES.join("\n")}\n`;
+}
+
+/**
+ * Make sure .gitignore covers every sensitive file and that none of them is
+ * tracked (repos created by older versions committed automaton.json).
+ */
+export async function ensureSensitiveFilesIgnored(
+  conway: ConwayClient,
+  dir: string,
+): Promise<void> {
+  let current = "";
+  try {
+    current = await conway.readFile(`${dir}/.gitignore`);
+  } catch {
+    current = "";
+  }
+  const lines = new Set(current.split("\n").map((l) => l.trim()));
+  const missing = SENSITIVE_STATE_FILES.filter((p) => !lines.has(p));
+  if (missing.length > 0) {
+    const next = current
+      ? `${current.replace(/\n?$/, "\n")}${missing.join("\n")}\n`
+      : buildStateGitignore();
+    await conway.writeFile(`${dir}/.gitignore`, next);
+  }
+
+  // Untrack anything sensitive that was committed before (keeps the file on disk).
+  const quoted = SENSITIVE_STATE_FILES.map((p) => `'${p.replace(/\/$/, "")}'`).join(" ");
+  await conway.exec(
+    `cd ${dir} && git rm -r --cached --ignore-unmatch --quiet -- ${quoted} >/dev/null 2>&1 || true`,
+    10000,
+  );
+}
+
 function resolveHome(p: string): string {
   const home = process.env.HOME || "/root";
   if (p.startsWith("~")) {
@@ -35,6 +93,8 @@ export async function initStateRepo(
   );
 
   if (checkResult.stdout.trim() === "exists") {
+    // Older repos may lack newer ignore rules or already track secrets.
+    await ensureSensitiveFilesIgnored(conway, dir);
     return;
   }
 
@@ -42,18 +102,7 @@ export async function initStateRepo(
   await gitInit(conway, dir);
 
   // Create .gitignore for sensitive files
-  const gitignore = `# Sensitive files - never commit
-wallet.json
-config.json
-state.db
-state.db-wal
-state.db-shm
-logs/
-*.log
-*.err
-`;
-
-  await conway.writeFile(`${dir}/.gitignore`, gitignore);
+  await conway.writeFile(`${dir}/.gitignore`, buildStateGitignore());
 
   // Configure git user
   await conway.exec(
@@ -75,6 +124,9 @@ export async function commitStateChange(
   category: string = "state",
 ): Promise<string> {
   const dir = resolveHome(AUTOMATON_DIR);
+
+  // `git add -A` below must never pick up secrets.
+  await ensureSensitiveFilesIgnored(conway, dir);
 
   // Check if there are changes
   const status = await gitStatus(conway, dir);

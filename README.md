@@ -40,6 +40,79 @@ curl -fsSL https://conway.tech/automaton.sh | sh
 
 Note: Conway Cloud, Domains, and Inference has seen immense demand. We are working on scaling & perfomance.
 
+## Standalone Mode (without Conway)
+
+Conway Cloud no longer accepts new accounts. In **standalone** mode the automaton keeps working the same way — its own wallet, autonomous USDC payments on Base, survival tiers — without any Conway account or API key:
+
+| Concern | Conway mode | Standalone mode |
+|---|---|---|
+| Commands / files | Conway sandbox | Run **locally on the host** |
+| Inference | Conway Compute (credits) | [BlockRun](https://blockrun.ai/docs/x402/endpoints), paid per call with **x402 v2** (USDC on Base, no account) |
+| Survival balance | Conway credits | **On-chain USDC balance of the agent wallet − reserve** |
+| Credit top-ups | Automatic Conway packs | None (fund the wallet with USDC) |
+| Sandboxes, ports, domains, credit transfers, replication | Available | **Disabled** (not offered to the model, refused by policy) |
+| Servers | Conway sandboxes | Fluence VMs — *phase 2*, see [docs/phase-2-fluence.md](docs/phase-2-fluence.md) |
+
+### Setup
+
+Run `node dist/index.js --setup` and answer `standalone` to the first question (it is the default). The wizard creates the wallet, skips Conway provisioning, asks for the BlockRun models and the spending caps, then prints the address to fund. Send **USDC on Base (chain 8453)** to that address — no ETH is needed: x402 payments are gasless EIP-3009 `transferWithAuthorization` signatures.
+
+Equivalent `~/.automaton/automaton.json` excerpt:
+
+```json
+{
+  "providerMode": "standalone",
+  "sandboxId": "",
+  "maxChildren": 0,
+  "autoUpdate": false,
+  "blockrun": {
+    "apiUrl": "https://blockrun.ai/api",
+    "models": {
+      "normal": "deepseek-chat",
+      "lowCompute": "deepseek-chat",
+      "critical": "deepseek-chat"
+    }
+  },
+  "treasuryPolicy": {
+    "maxInferenceDailyCents": 200,
+    "maxX402PaymentCents": 10,
+    "maxSingleTransferCents": 500,
+    "minimumReserveCents": 100,
+    "x402AllowedDomains": ["blockrun.ai", "api.fluence.dev"]
+  }
+}
+```
+
+`blockrun.models` maps survival tiers to models (`high` is optional and defaults to `normal`); pick tool-capable models from `GET https://blockrun.ai/api/v1/models`. No model name is hard-coded anymore: the routing matrix is built from this map.
+
+### Environment variables
+
+| Variable | Purpose |
+|---|---|
+| `AUTOMATON_PROVIDER_MODE` | `standalone` or `conway`; overrides `providerMode` from the config |
+| `BLOCKRUN_API_URL` | BlockRun base URL (default `https://blockrun.ai/api`) |
+| `AUTOMATON_RPC_URL` | Base RPC used to read the wallet's USDC balance (default: public RPC) |
+
+### Spending caps (defaults in standalone mode)
+
+| Setting | Default | Effect |
+|---|---|---|
+| `maxInferenceDailyCents` | 200 ($2/day) | Inference payments refused once reached (hourly envelope = daily / 6) |
+| `maxX402PaymentCents` | 10 ($0.10) | Any single x402 payment above this is refused **before signing** |
+| `maxSingleTransferCents` | 500 ($5) | Largest single transfer |
+| `minimumReserveCents` | 100 ($1) | Never spent: payments that would cross it are refused; it is also subtracted from the survival balance |
+| `x402AllowedDomains` | `blockrun.ai`, `api.fluence.dev` | x402 payments to any other host are refused |
+
+Other safeguards:
+
+- Every payment is checked by a spend guard *before* the authorization is signed (per-request cap, daily cap, reserve against the live on-chain balance). If the balance cannot be read, payments are refused (fail closed).
+- No double payment on retry: a signed authorization whose outcome is unknown (network error, 5xx) is re-sent as-is when the same request is retried. EIP-3009 nonces are single-use, so it can settle at most once. HTTP-level retries are disabled for paid requests.
+- Replication is disabled (`maxChildren: 0`); `spawn_child`, `fund_child` and `transfer_credits` are denied by policy in standalone mode.
+- The state repository in `~/.automaton` ignores and un-tracks `wallet.json`, `automaton.json` (API keys), `config.json`, `.env*`, `*.key`, databases and logs.
+- Automatic upstream update checks (`check_for_updates`, formerly every 4 h) are off by default; enable them with `"autoUpdate": true` **and** by enabling the heartbeat entry.
+
+The legacy Conway mode is unchanged and remains available with `"providerMode": "conway"` (the default for existing configs).
+
 ## How It Works
 
 Every automaton runs a continuous loop: **Think → Act → Observe → Repeat.**

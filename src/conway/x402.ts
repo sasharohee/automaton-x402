@@ -15,6 +15,7 @@ import {
 import { base, baseSepolia } from "viem/chains";
 import { ResilientHttpClient } from "./http-client.js";
 import type { ChainType } from "../identity/chain.js";
+import { x402PaidFetch, X402PaymentError, type X402SpendGuard } from "./x402-v2.js";
 
 const x402HttpClient = new ResilientHttpClient();
 
@@ -64,6 +65,15 @@ interface X402PaymentResult {
   response?: any;
   error?: string;
   status?: number;
+  /** Amount authorized for this request, in cents (0 when nothing was paid). */
+  amountPaidCents?: number;
+}
+
+export interface X402FetchOptions {
+  /** Restrict payments to these hosts (and subdomains). */
+  allowedDomains?: string[];
+  /** Spend guard (daily caps, reserve) consulted before signing. */
+  guard?: X402SpendGuard;
 }
 
 export interface UsdcBalanceResult {
@@ -307,7 +317,12 @@ export async function checkX402(
 
 /**
  * Fetch a URL with automatic x402 payment.
- * If the endpoint returns 402, sign and pay, then retry.
+ * If the endpoint returns 402, sign and pay, then retry once.
+ *
+ * x402 v2 challenges (`PAYMENT-REQUIRED` header) are handled by the official
+ * `@x402/*` client (see x402-v2.ts). Legacy v1 challenges (JSON body /
+ * `X-Payment-Required`, `maxAmountRequired`) remain supported for the
+ * Conway credits API.
  */
 export async function x402Fetch(
   url: string,
@@ -317,6 +332,7 @@ export async function x402Fetch(
   headers?: Record<string, string>,
   maxPaymentCents?: number,
   chainType?: ChainType,
+  options?: X402FetchOptions,
 ): Promise<X402PaymentResult> {
   // Solana wallets cannot sign EVM x402 payments
   if (chainType === "solana") {
@@ -327,21 +343,40 @@ export async function x402Fetch(
   }
 
   try {
-    // Initial request (non-mutating probe, uses resilient client)
-    const initialResp = await x402HttpClient.request(url, {
-      method,
-      headers: { ...headers, "Content-Type": "application/json" },
-      body,
-    });
+    const requestHeaders = { ...headers, "Content-Type": "application/json" };
 
-    if (initialResp.status !== 402) {
-      const data = await initialResp
-        .json()
-        .catch(() => initialResp.text());
-      return { success: initialResp.ok, response: data, status: initialResp.status };
+    // x402 v2 — also performs the initial, unpaid request.
+    let initialResp: Response;
+    try {
+      const v2 = await x402PaidFetch(
+        url,
+        { method, headers: requestHeaders, body },
+        {
+          account,
+          maxPaymentCents,
+          allowedDomains: options?.allowedDomains,
+          guard: options?.guard,
+        },
+      );
+      if (v2.payment || v2.response.status !== 402) {
+        const resp = v2.response;
+        const data = await resp.json().catch(() => resp.text());
+        return {
+          success: resp.ok,
+          response: data,
+          status: resp.status,
+          amountPaidCents: v2.payment?.amountCents ?? 0,
+        };
+      }
+      initialResp = v2.response;
+    } catch (err: any) {
+      if (err instanceof X402PaymentError) {
+        return { success: false, error: err.message, status: 402 };
+      }
+      throw err;
     }
 
-    // Parse payment requirements
+    // Legacy v1: parse payment requirements
     const parsed = await parsePaymentRequired(initialResp);
     if (!parsed) {
       return {
@@ -351,21 +386,41 @@ export async function x402Fetch(
       };
     }
 
+    const host = new URL(url).hostname;
+    if (
+      options?.allowedDomains &&
+      !options.allowedDomains.some((d) => host === d || host.endsWith(`.${d}`))
+    ) {
+      return { success: false, error: `Host "${host}" is not in the x402 allowlist`, status: 402 };
+    }
+
+    const amountAtomic = parseMaxAmountRequired(
+      parsed.requirement.maxAmountRequired,
+      parsed.x402Version,
+    );
+    // Convert atomic units (6 decimals) to cents (2 decimals)
+    const amountCents = Number(amountAtomic) / 10_000;
+
     // Check amount against maxPaymentCents BEFORE signing
-    if (maxPaymentCents !== undefined) {
-      const amountAtomic = parseMaxAmountRequired(
-        parsed.requirement.maxAmountRequired,
-        parsed.x402Version,
-      );
-      // Convert atomic units (6 decimals) to cents (2 decimals)
-      const amountCents = Number(amountAtomic) / 10_000;
-      if (amountCents > maxPaymentCents) {
-        return {
-          success: false,
-          error: `Payment of ${amountCents.toFixed(2)} cents exceeds max allowed ${maxPaymentCents} cents`,
-          status: 402,
-        };
-      }
+    if (maxPaymentCents !== undefined && amountCents > maxPaymentCents) {
+      return {
+        success: false,
+        error: `Payment of ${amountCents.toFixed(2)} cents exceeds max allowed ${maxPaymentCents} cents`,
+        status: 402,
+      };
+    }
+
+    const paymentInfo = {
+      url,
+      host,
+      amountAtomic,
+      amountCents,
+      payTo: parsed.requirement.payToAddress,
+      network: parsed.requirement.network,
+    };
+    if (options?.guard) {
+      const refusal = await options.guard.authorize(paymentInfo);
+      if (refusal) return { success: false, error: refusal, status: 402 };
     }
 
     // Sign payment
@@ -389,19 +444,32 @@ export async function x402Fetch(
       JSON.stringify(payment),
     ).toString("base64");
 
-    const paidResp = await x402HttpClient.request(url, {
-      method,
-      headers: {
-        ...headers,
-        "Content-Type": "application/json",
-        "X-Payment": paymentHeader,
-      },
-      body,
-      retries: 0, // Paid request: do not auto-retry (payment already signed)
-    });
+    let paidResp: Response;
+    try {
+      paidResp = await x402HttpClient.request(url, {
+        method,
+        headers: {
+          ...requestHeaders,
+          "X-Payment": paymentHeader,
+        },
+        body,
+        retries: 0, // Paid request: do not auto-retry (payment already signed)
+      });
+    } catch (err) {
+      // Outcome unknown: count the spend conservatively.
+      options?.guard?.record({ ...paymentInfo, settled: false });
+      throw err;
+    }
+    const paid = paidResp.status !== 402;
+    if (paid) options?.guard?.record({ ...paymentInfo, settled: paidResp.ok });
 
     const data = await paidResp.json().catch(() => paidResp.text());
-    return { success: paidResp.ok, response: data, status: paidResp.status };
+    return {
+      success: paidResp.ok,
+      response: data,
+      status: paidResp.status,
+      amountPaidCents: paid ? amountCents : 0,
+    };
   } catch (err: any) {
     return { success: false, error: err.message };
   }

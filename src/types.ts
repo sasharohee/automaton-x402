@@ -75,7 +75,50 @@ export interface AutomatonConfig {
   rpcUrl?: string;
   /** Chain type for this automaton. Defaults to "evm" if absent. */
   chainType?: ChainType;
+  /**
+   * Infrastructure provider. "conway" (default, legacy) uses Conway Cloud for
+   * sandboxes, credits and inference. "standalone" runs without Conway:
+   * commands execute on the host, inference is paid per call via x402 v2
+   * (BlockRun), and the survival balance is the on-chain USDC balance.
+   */
+  providerMode?: ProviderMode;
+  /** BlockRun inference settings (standalone mode). */
+  blockrun?: BlockRunConfig;
+  /**
+   * Allow the heartbeat to fetch upstream commits and wake the agent to
+   * review them. Disabled by default.
+   */
+  autoUpdate?: boolean;
 }
+
+export type ProviderMode = "conway" | "standalone";
+
+/**
+ * Survival-tier → model mapping. Replaces hard-coded model names so the
+ * routing matrix can target any provider's catalog.
+ */
+export interface ModelTierMap {
+  /** Model for the "high" tier. Defaults to `normal`. */
+  high?: string;
+  normal: string;
+  lowCompute: string;
+  critical: string;
+}
+
+export interface BlockRunConfig {
+  /** Base URL; `/v1/chat/completions` and `/v1/models` are appended. */
+  apiUrl: string;
+  models: ModelTierMap;
+}
+
+export const DEFAULT_BLOCKRUN_CONFIG: BlockRunConfig = {
+  apiUrl: "https://blockrun.ai/api",
+  models: {
+    normal: "deepseek-chat",
+    lowCompute: "deepseek-chat",
+    critical: "deepseek-chat",
+  },
+};
 
 export const DEFAULT_CONFIG: Partial<AutomatonConfig> = {
   conwayApiUrl: "https://api.conway.tech",
@@ -86,7 +129,8 @@ export const DEFAULT_CONFIG: Partial<AutomatonConfig> = {
   logLevel: "info",
   version: "0.2.1",
   skillsDir: "~/.automaton/skills",
-  maxChildren: 3,
+  // Replication is opt-in: no children unless explicitly configured.
+  maxChildren: 0,
   maxTurnsPerCycle: 25,
   childSandboxMemoryMb: 1024,
   socialRelayUrl: "https://social.conway.tech",
@@ -591,6 +635,23 @@ export const DEFAULT_TREASURY_POLICY: TreasuryPolicy = {
   maxTransfersPerTurn: 2,
   maxInferenceDailyCents: 50000,
   requireConfirmationAboveCents: 1000,
+};
+
+/**
+ * Defaults applied in standalone mode, where every payment is real USDC
+ * leaving the agent's own wallet.
+ */
+export const STANDALONE_TREASURY_POLICY: TreasuryPolicy = {
+  maxSingleTransferCents: 500, // $5
+  maxHourlyTransferCents: 500,
+  maxDailyTransferCents: 500,
+  minimumReserveCents: 100, // $1 kept untouched in the wallet
+  maxX402PaymentCents: 10, // $0.10 per request
+  x402AllowedDomains: ["blockrun.ai", "api.fluence.dev"],
+  transferCooldownMs: 0,
+  maxTransfersPerTurn: 1,
+  maxInferenceDailyCents: 200, // $2 / day
+  requireConfirmationAboveCents: 100,
 };
 
 // ─── Phase 1: Inbox Message Status ──────────────────────────────
@@ -1142,7 +1203,7 @@ export const DEFAULT_MEMORY_BUDGET: MemoryBudget = {
 
 // === Phase 2.3: Inference & Model Strategy Types ===
 
-export type ModelProvider = "openai" | "anthropic" | "conway" | "ollama" | "other";
+export type ModelProvider = "openai" | "anthropic" | "conway" | "ollama" | "blockrun" | "other";
 
 export type InferenceTaskType =
   | "agent_turn"
