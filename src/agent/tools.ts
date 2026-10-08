@@ -24,7 +24,8 @@ import { DEFAULT_TREASURY_POLICY } from "../types.js";
 import type { PolicyEngine } from "./policy-engine.js";
 import { sanitizeToolResult, sanitizeInput } from "./injection-defense.js";
 import { createLogger } from "../observability/logger.js";
-import { isStandalone } from "../conway/provider.js";
+import { isStandalone, resolveBlockRunConfig } from "../conway/provider.js";
+import { ModelEscalation } from "../inference/model-escalation.js";
 import { resolveWriteRoots, type WriteRoots } from "./workdir.js";
 
 const logger = createLogger("tools");
@@ -806,6 +807,39 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
         );
         ctx.db.setKV("sleep_reason", reason);
         return `Entering sleep mode for ${duration}s. Reason: ${reason}. Heartbeat will continue.`;
+      },
+    },
+    {
+      name: "think_hard",
+      description:
+        "Use a stronger, more expensive model for your NEXT turn only, then revert automatically. " +
+        "Reserved for genuinely hard reasoning (a subtle bug you cannot find, a tricky design decision). " +
+        "Do NOT use it for routine work, status checks or simple edits. Limited number of calls per hour.",
+      category: "survival",
+      riskLevel: "safe",
+      parameters: {
+        type: "object",
+        properties: {
+          reason: {
+            type: "string",
+            description: "Short reason why this needs harder reasoning (one sentence)",
+          },
+        },
+        required: ["reason"],
+      },
+      execute: async (args, ctx) => {
+        const reason = (args.reason as string).trim();
+        if (!reason) {
+          return "think_hard refused: give a short reason.";
+        }
+        if (!isStandalone(ctx.config)) {
+          return "think_hard is not available: no escalation model is configured in this mode.";
+        }
+        const escalation = new ModelEscalation(
+          ctx.db.raw,
+          resolveBlockRunConfig(ctx.config).escalation!,
+        );
+        return escalation.requestThinkHard(reason).message;
       },
     },
     {

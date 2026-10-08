@@ -76,6 +76,13 @@ import { isIdleOnlyTool } from "./idle-only-tools.js";
 import { turnSignature } from "./loop-detector.js";
 import { isStandalone, filterToolsForProvider, resolveBlockRunConfig } from "../conway/provider.js";
 import { buildRoutingMatrix, registerMappedModels } from "../inference/model-map.js";
+import {
+  ModelEscalation,
+  createEscalatingPlannerInference,
+  escalationReason,
+  routeWithEscalation,
+} from "../inference/model-escalation.js";
+import { isCodingTurn } from "./coding-heuristic.js";
 import { scheduleIdleSleep, resetIdleBackoff } from "./idle-backoff.js";
 import { ensureStandaloneWorkDir } from "./workdir.js";
 import { buildStandaloneEarningGuidance } from "./standalone-notice.js";
@@ -173,7 +180,9 @@ export async function runAgentLoop(
   const installedTools = loadInstalledTools(db);
   // Standalone mode: Conway-only tools (sandboxes, ports, domains, credit
   // transfers, replication) are never offered to the model.
-  const tools = filterToolsForProvider([...builtinTools, ...installedTools], config);
+  // think_hard needs the BlockRun escalation model (standalone only).
+  const tools = filterToolsForProvider([...builtinTools, ...installedTools], config)
+    .filter((tool) => standalone || tool.name !== "think_hard");
   const toolContext: ToolContext = {
     identity,
     config,
@@ -200,8 +209,13 @@ export async function runAgentLoop(
   // hard-coded Conway/OpenAI matrix.
   const blockrunConfig = standalone ? resolveBlockRunConfig(config) : undefined;
   if (blockrunConfig) {
-    registerMappedModels(modelRegistry, blockrunConfig.models, "blockrun");
+    registerMappedModels(modelRegistry, blockrunConfig.models, "blockrun", blockrunConfig.escalation?.model);
   }
+  // Hard work (coding, think_hard) runs on the escalation model, within its
+  // hourly limit; routine turns stay on the tier model.
+  const modelEscalation = blockrunConfig?.escalation
+    ? new ModelEscalation(db.raw, blockrunConfig.escalation, (message) => log(config, message))
+    : undefined;
   const budgetTracker = new InferenceBudgetTracker(db.raw, modelStrategyConfig);
   const inferenceRouter = new InferenceRouter(
     db.raw,
@@ -217,8 +231,10 @@ export async function runAgentLoop(
     options,
     standalone,
     blockrunConfig,
-    tools,
+    // Workers stay on their model: think_hard is for the parent only.
+    tools: tools.filter((tool) => tool.name !== "think_hard"),
     toolContext,
+    modelEscalation,
   });
   const planModeController = orchestration?.planModeController;
   const orchestrator = orchestration?.orchestrator;
@@ -232,6 +248,8 @@ export async function runAgentLoop(
   let consecutiveErrors = 0;
   let running = true;
   let lastToolPatterns: string[] = [];
+  // Whether the previous turn was non-trivial coding (escalation signal).
+  let previousTurnCoding = isCodingTurn(db.getRecentTurns(1)[0]?.toolCalls ?? []);
   // Persisted across wakes so an agent that wakes up and only checks its
   // status goes straight back to sleep.
   let idleToolTurns = parseInt(db.getKV(IDLE_TOOL_TURNS_KEY) || "0", 10) || 0;
@@ -546,20 +564,42 @@ export async function runAgentLoop(
 
       // ── Inference Call (via router when available) ──
       const survivalTier = getSurvivalTier(financial.creditsCents);
-      log(config, `[THINK] Routing inference (tier: ${survivalTier}, model: ${inference.getDefaultModel()})...`);
+      // think_hard applies to this single turn only: always consumed here.
+      const thinkHardReason = modelEscalation?.takeThinkHard();
+      const tierModel = inferenceRouter.selectModel(survivalTier, "agent_turn")?.modelId;
+      // Nothing to escalate (and no hourly slot to use) when the tier model
+      // already is the escalation model.
+      const escalationTicket =
+        modelEscalation && tierModel !== modelEscalation.model
+          ? modelEscalation.begin(
+              survivalTier,
+              escalationReason({ thinkHardReason, coding: previousTurnCoding }),
+            )
+          : null;
+      const routedModel = escalationTicket?.model ?? tierModel ?? inference.getDefaultModel();
+      log(config, `[THINK] Routing inference (tier: ${survivalTier}, model: ${routedModel})...`);
 
       const inferenceTools = toolsToInferenceFormat(tools);
-      const routerResult = await inferenceRouter.route(
-        {
-          messages: messages,
-          taskType: "agent_turn",
-          tier: survivalTier,
-          sessionId: db.getKV("session_id") || "default",
-          turnId: ulid(),
-          tools: inferenceTools,
-        },
-        (msgs, opts) => inference.chat(msgs, { ...opts, tools: inferenceTools }),
-      );
+      const sessionId = db.getKV("session_id") || "default";
+      const turnId = ulid();
+      const routerResult = await routeWithEscalation({
+        escalation: modelEscalation,
+        ticket: escalationTicket,
+        log: (message) => log(config, message),
+        run: (modelOverride) =>
+          inferenceRouter.route(
+            {
+              messages: messages,
+              taskType: "agent_turn",
+              tier: survivalTier,
+              sessionId,
+              turnId,
+              tools: inferenceTools,
+              modelOverride,
+            },
+            (msgs, opts) => inference.chat(msgs, { ...opts, tools: inferenceTools }),
+          ),
+      });
 
       // Build a compatible response for the rest of the loop
       const response = {
@@ -659,6 +699,7 @@ export async function runAgentLoop(
         }
       });
       onTurnComplete?.(turn);
+      previousTurnCoding = isCodingTurn(turn.toolCalls);
 
       // Phase 2.2: Post-turn memory ingestion (non-blocking)
       try {
@@ -904,8 +945,9 @@ function getOrCreateOrchestrationRuntime(params: {
   blockrunConfig: ReturnType<typeof resolveBlockRunConfig> | undefined;
   tools: AutomatonTool[];
   toolContext: ToolContext;
+  modelEscalation?: ModelEscalation;
 }): OrchestrationRuntime | undefined {
-  const { options, standalone, blockrunConfig, tools, toolContext } = params;
+  const { options, standalone, blockrunConfig, tools, toolContext, modelEscalation } = params;
   const { identity, config, db, conway, policyEngine, spendTracker } = options;
 
   if (orchestrationRuntimes.has(db)) {
@@ -936,6 +978,7 @@ function getOrCreateOrchestrationRuntime(params: {
           reasoning: blockrunConfig.models.normal,
           fast: blockrunConfig.models.lowCompute,
           cheap: blockrunConfig.models.critical,
+          escalation: modelEscalation?.model,
         },
         paidFetch: options.blockrunFetch,
       });
@@ -1032,6 +1075,19 @@ function getOrCreateOrchestrationRuntime(params: {
       // Planner budget = the loop's real financial state (spendable USDC
       // in standalone mode), not the parent's row in the children table.
       getFinancialState: () => runtime?.latestFinancial,
+      // The planner (planGoal / replanAfterFailure) is escalated within the
+      // hourly limit; workers keep using `unifiedInference` directly.
+      plannerInference: modelEscalation && blockrunConfig && options.blockrunFetch &&
+          blockrunConfig.models.normal !== modelEscalation.model
+        ? createEscalatingPlannerInference({
+            inner: unifiedInference,
+            escalation: modelEscalation,
+            providerId: "blockrun",
+            getTier: () =>
+              runtime?.latestFinancial ? getSurvivalTier(runtime.latestFinancial.creditsCents) : undefined,
+            log: (message) => log(config, message),
+          })
+        : undefined,
       config: {
         ...config,
         spawnAgent: async (task: any) => {
