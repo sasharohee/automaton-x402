@@ -245,6 +245,53 @@ export class ProviderRegistry {
   private readonly tierDefaults: Record<ModelTier, TierDefault>;
   private readonly disablements = new Map<string, ProviderDisablement>();
   private readonly emergencyStopCredits: number;
+  /** Per-provider fetch overrides (e.g. x402-paying fetch for BlockRun). */
+  private readonly fetchOverrides = new Map<string, typeof fetch>();
+
+  /**
+   * Registry with a single BlockRun provider (standalone mode). Requests go
+   * through `paidFetch`, which pays x402 v2 challenges; the OpenAI SDK's own
+   * retries are disabled so a retry can never trigger a second payment.
+   */
+  static forBlockRun(params: {
+    apiUrl: string;
+    models: { reasoning: string; fast: string; cheap: string };
+    paidFetch: typeof fetch;
+  }): ProviderRegistry {
+    const model = (id: string, tier: ModelTier): ModelConfig => ({
+      id,
+      tier,
+      contextWindow: 64000,
+      maxOutputTokens: 8192,
+      costPerInputToken: 0.27,
+      costPerOutputToken: 1.1,
+      supportsTools: true,
+      supportsVision: false,
+      supportsStreaming: false,
+    });
+    const provider: ProviderConfig = {
+      id: "blockrun",
+      name: "BlockRun (x402)",
+      baseUrl: `${params.apiUrl.replace(/\/$/, "")}/v1`,
+      apiKeyEnvVar: "BLOCKRUN_API_KEY",
+      models: [
+        model(params.models.reasoning, "reasoning"),
+        model(params.models.fast, "fast"),
+        model(params.models.cheap, "cheap"),
+      ],
+      maxRequestsPerMinute: 60,
+      maxTokensPerMinute: 200_000,
+      priority: 1,
+      enabled: true,
+    };
+    const only: TierDefault = { preferredProvider: "blockrun", fallbackOrder: [] };
+    const registry = new ProviderRegistry(
+      [provider],
+      { reasoning: only, fast: only, cheap: only },
+    );
+    registry.fetchOverrides.set("blockrun", params.paidFetch);
+    return registry;
+  }
 
   constructor(
     providers: ProviderConfig[],
@@ -431,9 +478,11 @@ export class ProviderRegistry {
 
   private buildResolvedModel(provider: ProviderConfig, model: ModelConfig): ResolvedModel {
     const apiKey = this.resolveApiKey(provider);
+    const customFetch = this.fetchOverrides.get(provider.id);
     const client = new OpenAI({
       apiKey,
       baseURL: provider.baseUrl,
+      ...(customFetch ? { fetch: customFetch, maxRetries: 0 } : {}),
     });
 
     return {
@@ -451,6 +500,11 @@ export class ProviderRegistry {
 
     if (provider.id === "local") {
       return "local";
+    }
+
+    if (this.fetchOverrides.has(provider.id)) {
+      // Paid per call via x402: no API key needed.
+      return "x402";
     }
 
     return `missing-${provider.apiKeyEnvVar.toLowerCase()}`;

@@ -58,7 +58,10 @@ export async function executeFundingStrategies(
   }
 
   if (tier === "critical" && hoursSinceLastBeg > 6) {
-    const msg = `Critical compute: ${formatCredits(creditsCents)} remaining. Top up via credit transfer API to ${identity.address}.`;
+    const topUpHint = config.providerMode === "standalone"
+      ? "Send USDC on Base (chain 8453) to"
+      : "Top up via credit transfer API to";
+    const msg = `Critical compute: ${formatCredits(creditsCents)} spendable. ${topUpHint} ${identity.address}.`;
     db.setKV("funding_notice_critical", msg);
     db.setKV(tierKey, new Date().toISOString());
 

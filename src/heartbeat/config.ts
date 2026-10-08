@@ -41,7 +41,8 @@ const DEFAULT_HEARTBEAT_CONFIG: HeartbeatConfig = {
       name: "check_for_updates",
       schedule: "0 */4 * * *",
       task: "check_for_updates",
-      enabled: true,
+      // Opt-in: no automatic upstream fetches. Also requires config.autoUpdate.
+      enabled: false,
     },
     {
       name: "health_check",

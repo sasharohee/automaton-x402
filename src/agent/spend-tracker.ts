@@ -13,6 +13,7 @@ import type {
   SpendCategory,
   TreasuryPolicy,
   LimitCheckResult,
+  SpendReservationResult,
 } from "../types.js";
 import {
   insertSpendRecord,
@@ -66,6 +67,47 @@ export class SpendTracker implements SpendTrackerInterface {
   getDailySpend(category: SpendCategory): number {
     const window = getCurrentDayWindow();
     return getSpendByWindow(this.db, category, "day", window);
+  }
+
+  /** Spend recorded today (UTC) across every category. */
+  getTotalDailySpend(): number {
+    const row = this.db
+      .prepare(
+        `SELECT COALESCE(SUM(amount_cents), 0) as total FROM spend_tracking WHERE window_day = ?`,
+      )
+      .get(getCurrentDayWindow()) as { total: number };
+    return row.total;
+  }
+
+  /**
+   * Atomically check the caps and record the spend (a reservation).
+   * Runs in a single IMMEDIATE transaction, so concurrent callers — in this
+   * process or another one sharing the database — cannot both pass the
+   * check before either has recorded its spend.
+   */
+  reserveSpend(entry: SpendEntry, limits: TreasuryPolicy): SpendReservationResult {
+    const reserve = this.db.transaction((): SpendReservationResult => {
+      const check = this.checkLimit(entry.amountCents, entry.category, limits);
+      if (!check.allowed) return check;
+      const id = ulid();
+      insertSpendRecord(this.db, {
+        id,
+        toolName: entry.toolName,
+        amountCents: entry.amountCents,
+        recipient: entry.recipient ?? null,
+        domain: entry.domain ?? null,
+        category: entry.category,
+        windowHour: getCurrentHourWindow(),
+        windowDay: getCurrentDayWindow(),
+      });
+      return { ...check, reservationId: id };
+    });
+    return reserve.immediate();
+  }
+
+  /** Cancel a reservation whose payment was never sent / not charged. */
+  releaseSpend(reservationId: string): void {
+    this.db.prepare("DELETE FROM spend_tracking WHERE id = ?").run(reservationId);
   }
 
   getTotalSpend(category: SpendCategory, since: Date): number {
@@ -126,6 +168,22 @@ export class SpendTracker implements SpendTrackerInterface {
         limitHourly,
         limitDaily,
       };
+    }
+
+    // Global cap, all categories combined (inference + x402 + transfers + other).
+    const limitTotal = limits.maxTotalDailySpendCents;
+    if (typeof limitTotal === "number" && Number.isFinite(limitTotal)) {
+      const totalDailySpend = this.getTotalDailySpend();
+      if (totalDailySpend + amount > limitTotal) {
+        return {
+          allowed: false,
+          reason: `Global daily spend cap exceeded (all categories): current ${totalDailySpend} + ${amount} > ${limitTotal}`,
+          currentHourlySpend,
+          currentDailySpend,
+          limitHourly,
+          limitDaily,
+        };
+      }
     }
 
     return {

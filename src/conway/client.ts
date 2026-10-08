@@ -6,9 +6,7 @@
  * Adapted from @aiws/sdk patterns.
  */
 
-import { execSync } from "child_process";
-import fs from "fs";
-import nodePath from "path";
+import { execLocal, writeFileLocal, readFileLocal } from "./local-exec.js";
 import type {
   ConwayClient,
   ExecResult,
@@ -108,24 +106,6 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
 
   const isLocal = !sandboxId;
 
-  const execLocal = (command: string, timeout?: number): ExecResult => {
-    try {
-      const stdout = execSync(command, {
-        timeout: timeout || 30_000,
-        encoding: "utf-8",
-        maxBuffer: 10 * 1024 * 1024,
-        cwd: process.env.HOME || "/root",
-      });
-      return { stdout: stdout || "", stderr: "", exitCode: 0 };
-    } catch (err: any) {
-      return {
-        stdout: err.stdout || "",
-        stderr: err.stderr || err.message || "",
-        exitCode: err.status ?? 1,
-      };
-    }
-  };
-
   const exec = async (
     command: string,
     timeout?: number,
@@ -163,22 +143,12 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
     }
   };
 
-  const resolveLocalPath = (filePath: string): string =>
-    filePath.startsWith("~")
-      ? nodePath.join(process.env.HOME || "/root", filePath.slice(1))
-      : filePath;
-
   const writeFile = async (
     filePath: string,
     content: string,
   ): Promise<void> => {
     if (isLocal) {
-      const resolved = resolveLocalPath(filePath);
-      const dir = nodePath.dirname(resolved);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
-      }
-      fs.writeFileSync(resolved, content, "utf-8");
+      writeFileLocal(filePath, content);
       return;
     }
     try {
@@ -200,7 +170,7 @@ export function createConwayClient(options: ConwayClientOptions): ConwayClient {
 
   const readFile = async (filePath: string): Promise<string> => {
     if (isLocal) {
-      return fs.readFileSync(resolveLocalPath(filePath), "utf-8");
+      return readFileLocal(filePath);
     }
     try {
       const result = await request(

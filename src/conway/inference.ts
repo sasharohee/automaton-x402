@@ -29,9 +29,18 @@ interface InferenceClientOptions {
   ollamaBaseUrl?: string;
   /** Optional registry lookup — if provided, used before name heuristics */
   getModelProvider?: (modelId: string) => string | undefined;
+  /**
+   * BlockRun (standalone mode): OpenAI-compatible endpoint paid per call
+   * with x402 v2. When set, BlockRun replaces Conway as the default backend.
+   */
+  blockrun?: {
+    apiUrl: string;
+    /** fetch that pays x402 challenges (see conway/x402-v2.ts). */
+    fetch: typeof fetch;
+  };
 }
 
-type InferenceBackend = "conway" | "openai" | "anthropic" | "ollama";
+type InferenceBackend = "conway" | "openai" | "anthropic" | "ollama" | "blockrun";
 
 function isLoopbackHttpUrl(url: string | undefined): boolean {
   if (!url) return false;
@@ -48,7 +57,7 @@ function isLoopbackHttpUrl(url: string | undefined): boolean {
 export function createInferenceClient(
   options: InferenceClientOptions,
 ): InferenceClient {
-  const { apiUrl, apiKey, openaiApiKey, anthropicApiKey, ollamaBaseUrl, getModelProvider } = options;
+  const { apiUrl, apiKey, openaiApiKey, anthropicApiKey, ollamaBaseUrl, getModelProvider, blockrun } = options;
   const httpClient = new ResilientHttpClient({
     baseTimeout: INFERENCE_TIMEOUT_MS,
     retryableStatuses: [429, 500, 502, 503, 504],
@@ -69,12 +78,13 @@ export function createInferenceClient(
       anthropicApiKey,
       ollamaBaseUrl,
       getModelProvider,
+      blockrun: !!blockrun,
     });
 
     // Newer models (o-series, gpt-5.x, gpt-4.1) require max_completion_tokens.
     // Ollama always uses max_tokens.
     const usesCompletionTokens =
-      backend !== "ollama" && /^(o[1-9]|gpt-5|gpt-4\.1)/.test(model);
+      backend !== "ollama" && /^(?:openai\/)?(o[1-9]|gpt-5|gpt-4\.1)/.test(model);
     const tokenLimit = opts?.maxTokens || maxTokens;
 
     const body: Record<string, unknown> = {
@@ -110,6 +120,11 @@ export function createInferenceClient(
       });
     }
 
+    if (backend === "blockrun") {
+      // resolveInferenceBackend only returns "blockrun" when it is configured
+      return chatViaBlockRun({ model, body, blockrun: blockrun! });
+    }
+
     const openAiLikeApiUrl =
       backend === "openai" ? "https://api.openai.com" :
       backend === "ollama" ? (ollamaBaseUrl as string).replace(/\/$/, "") :
@@ -135,7 +150,7 @@ export function createInferenceClient(
    */
   const setLowComputeMode = (enabled: boolean): void => {
     if (enabled) {
-      currentModel = options.lowComputeModel || "gpt-5-mini";
+      currentModel = options.lowComputeModel || options.defaultModel;
       maxTokens = 4096;
     } else {
       currentModel = options.defaultModel;
@@ -181,6 +196,7 @@ function resolveInferenceBackend(
     anthropicApiKey?: string;
     ollamaBaseUrl?: string;
     getModelProvider?: (modelId: string) => string | undefined;
+    blockrun?: boolean;
   },
 ): InferenceBackend {
   // Registry-based routing: most accurate, no name guessing
@@ -189,14 +205,15 @@ function resolveInferenceBackend(
     if (provider === "ollama" && keys.ollamaBaseUrl) return "ollama";
     if (provider === "anthropic" && keys.anthropicApiKey) return "anthropic";
     if (provider === "openai" && keys.openaiApiKey) return "openai";
-    if (provider === "conway") return "conway";
+    if (provider === "blockrun" && keys.blockrun) return "blockrun";
+    if (provider === "conway" && !keys.blockrun) return "conway";
     // provider unknown or key not configured — fall through to heuristics
   }
 
   // Heuristic fallback (model not in registry yet)
   if (keys.anthropicApiKey && /^claude/i.test(model)) return "anthropic";
   if (keys.openaiApiKey && /^(gpt-[3-9]|gpt-4|gpt-5|o[1-9][-\s.]|o[1-9]$|chatgpt)/i.test(model)) return "openai";
-  return "conway";
+  return keys.blockrun ? "blockrun" : "conway";
 
 }
 
@@ -228,7 +245,46 @@ async function chatViaOpenAiCompatible(params: {
     );
   }
 
-  const data = await resp.json() as any;
+  return parseOpenAiCompletion(await resp.json(), params.model);
+}
+
+/**
+ * BlockRun: OpenAI-compatible chat completions, paid per call via x402 v2.
+ * Uses the paying fetch directly — no generic HTTP retries, since a blind
+ * retry must never trigger a second payment (the x402 layer handles that).
+ */
+async function chatViaBlockRun(params: {
+  model: string;
+  body: Record<string, unknown>;
+  blockrun: { apiUrl: string; fetch: typeof fetch };
+}): Promise<InferenceResponse> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), INFERENCE_TIMEOUT_MS);
+  let resp: Response;
+  try {
+    resp = await params.blockrun.fetch(
+      `${params.blockrun.apiUrl.replace(/\/$/, "")}/v1/chat/completions`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(params.body),
+        signal: controller.signal,
+      },
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+
+  if (!resp.ok) {
+    const text = await resp.text();
+    throw new Error(`Inference error (blockrun): ${resp.status}: ${text}`);
+  }
+
+  return parseOpenAiCompletion(await resp.json(), params.model);
+}
+
+function parseOpenAiCompletion(raw: unknown, model: string): InferenceResponse {
+  const data = raw as any;
   const choice = data.choices?.[0];
 
   if (!choice) {
@@ -254,7 +310,7 @@ async function chatViaOpenAiCompatible(params: {
 
   return {
     id: data.id || "",
-    model: data.model || params.model,
+    model: data.model || model,
     message: {
       role: message.role,
       content: message.content || "",

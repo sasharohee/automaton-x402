@@ -65,6 +65,8 @@ import { createWorkerInferenceBridge } from "./worker-inference-bridge.js";
 import { ProviderRegistry } from "../inference/provider-registry.js";
 import { UnifiedInferenceClient } from "../inference/inference-client.js";
 import { isIdleOnlyTool } from "./idle-only-tools.js";
+import { isStandalone, filterToolsForProvider, resolveBlockRunConfig } from "../conway/provider.js";
+import { buildRoutingMatrix, registerMappedModels } from "../inference/model-map.js";
 
 const logger = createLogger("loop");
 const MAX_TOOL_CALLS_PER_TURN = 10;
@@ -84,6 +86,8 @@ export interface AgentLoopOptions {
   onStateChange?: (state: AgentState) => void;
   onTurnComplete?: (turn: AgentTurn) => void;
   ollamaBaseUrl?: string;
+  /** Standalone mode: guarded x402 fetch used for BlockRun inference. */
+  blockrunFetch?: typeof fetch;
 }
 
 /**
@@ -96,9 +100,12 @@ export async function runAgentLoop(
   const { identity, config, db, conway, inference, social, skills, policyEngine, spendTracker, onStateChange, onTurnComplete, ollamaBaseUrl } =
     options;
 
+  const standalone = isStandalone(config);
   const builtinTools = createBuiltinTools(identity.sandboxId);
   const installedTools = loadInstalledTools(db);
-  const tools = [...builtinTools, ...installedTools];
+  // Standalone mode: Conway-only tools (sandboxes, ports, domains, credit
+  // transfers, replication) are never offered to the model.
+  const tools = filterToolsForProvider([...builtinTools, ...installedTools], config);
   const toolContext: ToolContext = {
     identity,
     config,
@@ -121,8 +128,19 @@ export async function runAgentLoop(
     const { discoverOllamaModels } = await import("../ollama/discover.js");
     await discoverOllamaModels(ollamaBaseUrl, db.raw);
   }
+  // Standalone: route to the configured BlockRun models instead of the
+  // hard-coded Conway/OpenAI matrix.
+  const blockrunConfig = standalone ? resolveBlockRunConfig(config) : undefined;
+  if (blockrunConfig) {
+    registerMappedModels(modelRegistry, blockrunConfig.models, "blockrun");
+  }
   const budgetTracker = new InferenceBudgetTracker(db.raw, modelStrategyConfig);
-  const inferenceRouter = new InferenceRouter(db.raw, modelRegistry, budgetTracker);
+  const inferenceRouter = new InferenceRouter(
+    db.raw,
+    modelRegistry,
+    budgetTracker,
+    blockrunConfig ? buildRoutingMatrix(blockrunConfig.models) : undefined,
+  );
 
   // Optional orchestration bootstrap (requires V9 goals/task tables)
   let planModeController: PlanModeController | undefined;
@@ -133,40 +151,55 @@ export async function runAgentLoop(
     try {
       planModeController = new PlanModeController(db.raw);
 
-      // Bridge automaton config API keys to env vars for the provider registry.
-      // The registry reads keys from process.env; the automaton config may have
-      // them from config.json or Conway provisioning.
-      if (config.openaiApiKey && !process.env.OPENAI_API_KEY) {
-        process.env.OPENAI_API_KEY = config.openaiApiKey;
-      }
-      if (config.anthropicApiKey && !process.env.ANTHROPIC_API_KEY) {
-        process.env.ANTHROPIC_API_KEY = config.anthropicApiKey;
-      }
-      // Conway Compute API is OpenAI-compatible. Use it as fallback when no
-      // direct OpenAI key is available. The conwayApiKey is always present
-      // (required for sandbox operations), so this ensures the orchestrator
-      // can always make inference calls.
-      if (config.conwayApiKey && !process.env.CONWAY_API_KEY) {
-        process.env.CONWAY_API_KEY = config.conwayApiKey;
-      }
-      // If no OpenAI key is set but Conway key is available, use Conway as
-      // the OpenAI provider (Conway Compute is OpenAI API-compatible).
-      if (!process.env.OPENAI_API_KEY && config.conwayApiKey) {
-        process.env.OPENAI_API_KEY = config.conwayApiKey;
-        process.env.OPENAI_BASE_URL = `${config.conwayApiUrl}/v1`;
-      }
+      let registry: ProviderRegistry;
+      if (blockrunConfig && options.blockrunFetch) {
+        // Standalone: orchestrator/workers use BlockRun, paid via the same
+        // guarded x402 fetch as the main loop (shared caps and reserve).
+        registry = ProviderRegistry.forBlockRun({
+          apiUrl: blockrunConfig.apiUrl,
+          models: {
+            reasoning: blockrunConfig.models.normal,
+            fast: blockrunConfig.models.lowCompute,
+            cheap: blockrunConfig.models.critical,
+          },
+          paidFetch: options.blockrunFetch,
+        });
+      } else {
+        // Bridge automaton config API keys to env vars for the provider registry.
+        // The registry reads keys from process.env; the automaton config may have
+        // them from config.json or Conway provisioning.
+        if (config.openaiApiKey && !process.env.OPENAI_API_KEY) {
+          process.env.OPENAI_API_KEY = config.openaiApiKey;
+        }
+        if (config.anthropicApiKey && !process.env.ANTHROPIC_API_KEY) {
+          process.env.ANTHROPIC_API_KEY = config.anthropicApiKey;
+        }
+        // Conway Compute API is OpenAI-compatible. Use it as fallback when no
+        // direct OpenAI key is available. The conwayApiKey is always present
+        // (required for sandbox operations), so this ensures the orchestrator
+        // can always make inference calls.
+        if (config.conwayApiKey && !process.env.CONWAY_API_KEY) {
+          process.env.CONWAY_API_KEY = config.conwayApiKey;
+        }
+        // If no OpenAI key is set but Conway key is available, use Conway as
+        // the OpenAI provider (Conway Compute is OpenAI API-compatible).
+        if (!process.env.OPENAI_API_KEY && config.conwayApiKey) {
+          process.env.OPENAI_API_KEY = config.conwayApiKey;
+          process.env.OPENAI_BASE_URL = `${config.conwayApiUrl}/v1`;
+        }
 
-      const providersPath = path.join(
-        process.env.HOME || process.cwd(),
-        ".automaton",
-        "inference-providers.json",
-      );
-      const registry = ProviderRegistry.fromConfig(providersPath);
+        const providersPath = path.join(
+          process.env.HOME || process.cwd(),
+          ".automaton",
+          "inference-providers.json",
+        );
+        registry = ProviderRegistry.fromConfig(providersPath);
 
-      // If OPENAI_BASE_URL was set (Conway fallback), update the default
-      // provider's baseUrl so the OpenAI client points to Conway Compute.
-      if (process.env.OPENAI_BASE_URL) {
-        registry.overrideBaseUrl("openai", process.env.OPENAI_BASE_URL);
+        // If OPENAI_BASE_URL was set (Conway fallback), update the default
+        // provider's baseUrl so the OpenAI client points to Conway Compute.
+        if (process.env.OPENAI_BASE_URL) {
+          registry.overrideBaseUrl("openai", process.env.OPENAI_BASE_URL);
+        }
       }
 
       const unifiedInference = new UnifiedInferenceClient(registry);
@@ -221,6 +254,19 @@ export async function runAgentLoop(
         config: {
           ...config,
           spawnAgent: async (task: any) => {
+            // Standalone: no sandboxes and no replication — in-process workers only.
+            if (standalone) {
+              try {
+                return initializedWorkerPool.spawn(task);
+              } catch (localError) {
+                logger.warn("Failed to spawn local worker", {
+                  taskId: task.id,
+                  error: localError instanceof Error ? localError.message : String(localError),
+                });
+                return null;
+              }
+            }
+
             // Try Conway sandbox spawn first (production)
             try {
               const { generateGenesisConfig } = await import("../replication/genesis.js");
@@ -441,7 +487,8 @@ export async function runAgentLoop(
         // available, buy credits NOW — before attempting inference.
         // This prevents the agent from dying mid-loop while waiting for
         // the heartbeat to fire. Uses a 60s cooldown to avoid hammering.
-        if ((tier === "critical" || tier === "low_compute") && financial.usdcBalance >= 5) {
+        // Standalone mode has no credits to buy: the USDC balance IS the budget.
+        if (!standalone && (tier === "critical" || tier === "low_compute") && financial.usdcBalance >= 5) {
           const INLINE_TOPUP_COOLDOWN_MS = 60_000;
           const lastInlineTopup = db.getKV("last_inline_topup_attempt");
           const cooldownExpired = !lastInlineTopup ||

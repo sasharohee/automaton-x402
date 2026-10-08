@@ -13,8 +13,15 @@ import { getWallet, getAutomatonDir } from "./identity/wallet.js";
 import { provision, loadApiKeyFromConfig } from "./identity/provision.js";
 import { loadConfig, resolvePath } from "./config.js";
 import { createDatabase } from "./state/database.js";
-import { createConwayClient } from "./conway/client.js";
 import { createInferenceClient } from "./conway/inference.js";
+import {
+  isStandalone,
+  createProviderClient,
+  createBlockRunPaymentFetch,
+  resolveBlockRunConfig,
+  resolveTreasuryPolicy,
+} from "./conway/provider.js";
+import { registerMappedModels } from "./inference/model-map.js";
 import { createHeartbeatDaemon } from "./heartbeat/daemon.js";
 import {
   loadHeartbeatConfig,
@@ -30,7 +37,6 @@ import { PolicyEngine } from "./agent/policy-engine.js";
 import { SpendTracker } from "./agent/spend-tracker.js";
 import { createDefaultRules } from "./agent/policy-rules/index.js";
 import type { AutomatonIdentity, AgentState, Skill, SocialClientInterface } from "./types.js";
-import { DEFAULT_TREASURY_POLICY } from "./types.js";
 import { createLogger, setGlobalLogLevel, StructuredLogger } from "./observability/logger.js";
 import { prettySink } from "./observability/pretty-sink.js";
 import { bootstrapTopup } from "./conway/topup.js";
@@ -67,6 +73,9 @@ Usage:
   automaton --help         Show this help
 
 Environment:
+  AUTOMATON_PROVIDER_MODE  "standalone" (no Conway) or "conway" (overrides config)
+  BLOCKRUN_API_URL         BlockRun base URL (standalone, default: https://blockrun.ai/api)
+  AUTOMATON_RPC_URL        Base RPC endpoint used to read the USDC balance
   CONWAY_API_URL           Conway API URL (default: https://api.conway.tech)
   CONWAY_API_KEY           Conway API key (overrides config)
   OLLAMA_BASE_URL          Ollama base URL (overrides config, e.g. http://localhost:11434)
@@ -96,6 +105,10 @@ Environment:
   }
 
   if (args.includes("--provision")) {
+    if (isStandalone(loadConfig())) {
+      logger.info("Standalone mode: no Conway API key is needed. Nothing to provision.");
+      process.exit(0);
+    }
     try {
       const result = await provision();
       logger.info(JSON.stringify(result));
@@ -196,10 +209,19 @@ async function run(): Promise<void> {
   // Load wallet (chain-aware)
   const { account, chainIdentity, chainType: walletChainType } = await getWallet();
   const resolvedChainType = config.chainType || walletChainType || "evm";
-  const apiKey = config.conwayApiKey || loadApiKeyFromConfig();
-  if (!apiKey) {
+  const standalone = isStandalone(config);
+  if (standalone && resolvedChainType !== "evm") {
+    logger.error("Standalone mode requires an EVM wallet (USDC on Base, x402 EIP-3009).");
+    process.exit(1);
+  }
+  // Standalone mode never talks to Conway: no API key needed.
+  const apiKey = standalone ? "" : (config.conwayApiKey || loadApiKeyFromConfig());
+  if (!standalone && !apiKey) {
     logger.error("No API key found. Run: automaton --provision");
     process.exit(1);
+  }
+  if (standalone) {
+    logger.info(`[${new Date().toISOString()}] Provider: standalone (no Conway) — inference via BlockRun x402, host execution.`);
   }
 
   // Initialize database
@@ -220,7 +242,7 @@ async function run(): Promise<void> {
     account,
     creatorAddress: config.creatorAddress,
     sandboxId: config.sandboxId,
-    apiKey,
+    apiKey: apiKey || "",
     createdAt,
     chainType: resolvedChainType,
     chainIdentity,
@@ -238,16 +260,16 @@ async function run(): Promise<void> {
     db.setIdentity("automatonId", automatonId);
   }
 
-  // Create Conway client
-  const conway = createConwayClient({
-    apiUrl: config.conwayApiUrl,
-    apiKey,
-    sandboxId: config.sandboxId,
+  // Create infrastructure client (Conway, or standalone host/USDC provider)
+  const conway = createProviderClient({
+    config,
+    apiKey: apiKey || "",
+    walletAddress: chainIdentity.address,
   });
 
-  // Register automaton identity (one-time, immutable)
+  // Register automaton identity with Conway (one-time, immutable). Skipped in standalone mode.
   const registrationState = db.getIdentity("conwayRegistrationStatus");
-  if (registrationState !== "registered") {
+  if (!standalone && registrationState !== "registered") {
     try {
       const genesisPromptHash = config.genesisPrompt
         ? keccak256(toHex(config.genesisPrompt))
@@ -284,16 +306,37 @@ async function run(): Promise<void> {
   // "gpt-oss:120b" route to Ollama based on their registered provider, not heuristics.
   const modelRegistry = new ModelRegistry(db.raw);
   modelRegistry.initialize();
+
+  // Policy engine + spend tracker are needed before inference in standalone
+  // mode: every BlockRun call is a real USDC payment checked by the guard.
+  const treasuryPolicy = resolveTreasuryPolicy(config);
+  const rules = createDefaultRules(treasuryPolicy);
+  const policyEngine = new PolicyEngine(db.raw, rules);
+  const spendTracker = new SpendTracker(db.raw);
+
+  let blockrunFetch: typeof fetch | undefined;
+  let blockrunApiUrl: string | undefined;
+  if (standalone) {
+    const blockrun = resolveBlockRunConfig(config);
+    registerMappedModels(modelRegistry, blockrun.models, "blockrun");
+    blockrunFetch = createBlockRunPaymentFetch({ config, account, spendTracker }).fetch;
+    blockrunApiUrl = blockrun.apiUrl;
+    logger.info(
+      `[${new Date().toISOString()}] BlockRun models: high=${blockrun.models.high || blockrun.models.normal} normal=${blockrun.models.normal} low=${blockrun.models.lowCompute} critical=${blockrun.models.critical} | caps: $${(treasuryPolicy.maxTotalDailySpendCents / 100).toFixed(2)}/day total, $${(treasuryPolicy.maxInferenceDailyCents / 100).toFixed(2)}/day inference, $${(treasuryPolicy.maxX402PaymentCents / 100).toFixed(2)}/request, reserve $${(treasuryPolicy.minimumReserveCents / 100).toFixed(2)}`,
+    );
+  }
+
   const inference = createInferenceClient({
     apiUrl: config.conwayApiUrl,
-    apiKey,
+    apiKey: apiKey || "",
     defaultModel: config.inferenceModel,
     maxTokens: config.maxTokensPerTurn,
-    lowComputeModel: config.modelStrategy?.lowComputeModel || "gpt-5-mini",
+    lowComputeModel: config.modelStrategy?.lowComputeModel || config.inferenceModel,
     openaiApiKey: config.openaiApiKey,
     anthropicApiKey: config.anthropicApiKey,
     ollamaBaseUrl,
     getModelProvider: (modelId) => modelRegistry.get(modelId)?.provider,
+    blockrun: blockrunFetch && blockrunApiUrl ? { apiUrl: blockrunApiUrl, fetch: blockrunFetch } : undefined,
   });
 
   if (ollamaBaseUrl) {
@@ -306,12 +349,6 @@ async function run(): Promise<void> {
     social = createSocialClient(config.socialRelayUrl, resolvedChainType === "solana" ? chainIdentity : account);
     logger.info(`[${new Date().toISOString()}] Social relay: ${config.socialRelayUrl}`);
   }
-
-  // Initialize PolicyEngine + SpendTracker (Phase 1.4)
-  const treasuryPolicy = config.treasuryPolicy ?? DEFAULT_TREASURY_POLICY;
-  const rules = createDefaultRules(treasuryPolicy);
-  const policyEngine = new PolicyEngine(db.raw, rules);
-  const spendTracker = new SpendTracker(db.raw);
 
   // Load and sync heartbeat config
   const heartbeatConfigPath = resolvePath(config.heartbeatConfigPath);
@@ -338,7 +375,8 @@ async function run(): Promise<void> {
 
   // Bootstrap topup: buy minimum credits ($5) from USDC so the agent can start.
   // The agent decides larger topups itself via the topup_credits tool.
-  try {
+  // Standalone mode has no Conway credits: USDC is spent directly per call.
+  if (!standalone) try {
     let bootstrapTimer: ReturnType<typeof setTimeout>;
     const bootstrapTimeout = new Promise<null>((_, reject) => {
       bootstrapTimer = setTimeout(() => reject(new Error("bootstrap topup timed out")), 15_000);
@@ -424,6 +462,7 @@ async function run(): Promise<void> {
         policyEngine,
         spendTracker,
         ollamaBaseUrl,
+        blockrunFetch,
         onStateChange: (state: AgentState) => {
           logger.info(`[${new Date().toISOString()}] State: ${state}`);
         },

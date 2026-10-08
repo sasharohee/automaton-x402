@@ -53,6 +53,27 @@ function saveConfig(apiKey: string, walletAddress: string): void {
 }
 
 /**
+ * True when standalone mode is selected by the environment or by
+ * ~/.automaton/automaton.json (same precedence as loadConfig: an explicit
+ * AUTOMATON_PROVIDER_MODE wins). Reads the file directly: config.ts imports
+ * this module, so it cannot be imported here.
+ */
+export function isStandaloneConfigured(): boolean {
+  if (process.env.AUTOMATON_PROVIDER_MODE === "standalone") return true;
+  if (process.env.AUTOMATON_PROVIDER_MODE === "conway") return false;
+  const configPath = path.join(getAutomatonDir(), "automaton.json");
+  if (!fs.existsSync(configPath)) return false;
+  try {
+    const raw = JSON.parse(fs.readFileSync(configPath, "utf-8"));
+    return raw?.providerMode === "standalone";
+  } catch {
+    // Unreadable config: do not risk contacting Conway on behalf of a
+    // possibly-standalone automaton.
+    return true;
+  }
+}
+
+/**
  * Run the full SIWE provisioning flow:
  * 1. Load wallet
  * 2. Get nonce from Conway API
@@ -65,6 +86,11 @@ export async function provision(
   apiUrl?: string,
   solanaIdentity?: ChainIdentity,
 ): Promise<ProvisionResult> {
+  // Standalone mode never contacts Conway (no account, no API key).
+  if (isStandaloneConfigured()) {
+    throw new Error("Conway provisioning is disabled in standalone mode.");
+  }
+
   const url = apiUrl || process.env.CONWAY_API_URL || DEFAULT_API_URL;
 
   // 1. Load wallet

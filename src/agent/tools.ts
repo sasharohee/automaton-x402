@@ -19,6 +19,7 @@ import type {
   InputSource,
   SpendTrackerInterface,
 } from "../types.js";
+import { DEFAULT_TREASURY_POLICY } from "../types.js";
 import type { PolicyEngine } from "./policy-engine.js";
 import { sanitizeToolResult, sanitizeInput } from "./injection-defense.js";
 import { createLogger } from "../observability/logger.js";
@@ -1021,6 +1022,13 @@ Model: ${ctx.inference.getDefaultModel()}
           return `Blocked: Cannot transfer more than half your balance ($${(balance / 100).toFixed(2)}). Self-preservation.`;
         }
 
+        // Guard: the treasury reserve must survive the transfer
+        const reserveCents =
+          ctx.config.treasuryPolicy?.minimumReserveCents ?? DEFAULT_TREASURY_POLICY.minimumReserveCents;
+        if (balance - amount < reserveCents) {
+          return `Blocked: Transfer would drop balance below the minimum reserve of $${(reserveCents / 100).toFixed(2)}.`;
+        }
+
         const transfer = await ctx.conway.transferCredits(
           args.to_address as string,
           amount,
@@ -1757,6 +1765,12 @@ Model: ${ctx.inference.getDefaultModel()}
         const balance = await ctx.conway.getCreditsBalance();
         if (amount > balance / 2) {
           return `Blocked: Cannot transfer more than half your balance. Self-preservation.`;
+        }
+
+        const reserveCents =
+          ctx.config.treasuryPolicy?.minimumReserveCents ?? DEFAULT_TREASURY_POLICY.minimumReserveCents;
+        if (balance - amount < reserveCents) {
+          return `Blocked: Funding would drop balance below the minimum reserve of $${(reserveCents / 100).toFixed(2)}.`;
         }
 
         const transfer = await ctx.conway.transferCredits(
@@ -2759,7 +2773,6 @@ Model: ${ctx.inference.getDefaultModel()}
         }
 
         const { x402Fetch } = await import("../conway/x402.js");
-        const { DEFAULT_TREASURY_POLICY } = await import("../types.js");
         const url = args.url as string;
         const method = (args.method as string) || "GET";
         const body = args.body as string | undefined;
@@ -2767,16 +2780,28 @@ Model: ${ctx.inference.getDefaultModel()}
           ? JSON.parse(args.headers as string)
           : undefined;
 
-        const maxPayment =
-          ctx.config.treasuryPolicy?.maxX402PaymentCents ??
-          DEFAULT_TREASURY_POLICY.maxX402PaymentCents;
+        const { resolveTreasuryPolicy, readWalletBalanceCents } = await import("../conway/provider.js");
+        const { SpendGuard } = await import("../survival/spend-guard.js");
+        const { SpendTracker } = await import("./spend-tracker.js");
+        const policy = resolveTreasuryPolicy(ctx.config);
+        // Real enforcement before signing: per-payment max, x402 caps and
+        // the wallet reserve (payments come out of the on-chain USDC balance).
+        const guard = new SpendGuard({
+          policy,
+          category: "x402",
+          spendTracker: new SpendTracker(ctx.db.raw),
+          getBalanceCents: () => readWalletBalanceCents(ctx.identity.address),
+          toolName: "x402_fetch",
+        });
         const result = await x402Fetch(
           url,
           ctx.identity.account,
           method,
           body,
           extraHeaders,
-          maxPayment,
+          policy.maxX402PaymentCents,
+          chainType,
+          { allowedDomains: policy.x402AllowedDomains, guard },
         );
 
         if (!result.success) {
