@@ -55,6 +55,12 @@ export interface X402SpendGuard {
   authorize(payment: X402PaymentInfo): Promise<string | null> | string | null;
   /** Called exactly once per signed authorization that was sent to the server. */
   record(payment: X402PaymentInfo & { settled: boolean; transaction?: string }): void;
+  /**
+   * Called when an authorized payment ends up not being charged (signing
+   * failed, or the server rejected the authorization), so a spend reserved
+   * by `authorize()` can be cancelled.
+   */
+  release?(payment: X402PaymentInfo): void;
 }
 
 export interface X402PaymentOptions {
@@ -281,7 +287,9 @@ export async function x402PaidFetch(
     return sendPaid(url, init, baseHeaders, pending, key, ledger, fetchImpl, options);
   }
 
-  const initial = await fetchImpl(url, { ...init, headers: baseHeaders });
+  // Redirects are never followed: the challenge must come from (and the
+  // signed payment header may only ever be sent to) the allowlisted host.
+  const initial = await fetchImpl(url, { ...init, headers: baseHeaders, redirect: "manual" });
   if (initial.status !== 402) return { response: initial };
 
   const paymentRequired = decodePaymentRequiredHeader(initial.headers.get(PAYMENT_REQUIRED_HEADER));
@@ -334,6 +342,7 @@ export async function x402PaidFetch(
     const payload = await signer.createPaymentPayload({ ...paymentRequired, accepts: [requirement] });
     headers = signer.encodePaymentSignatureHeader(payload);
   } catch (err: any) {
+    options.guard?.release?.(payment);
     throw new X402PaymentError(`Failed to sign payment: ${err?.message || String(err)}`, "SIGNING_FAILED");
   }
 
@@ -365,7 +374,13 @@ async function sendPaid(
 
   let response: Response;
   try {
-    response = await fetchImpl(url, { ...init, headers: { ...baseHeaders, ...entry.headers } });
+    // `redirect: "manual"`: a 3xx is returned as-is, so the signed
+    // PAYMENT-SIGNATURE header can never be forwarded to another host.
+    response = await fetchImpl(url, {
+      ...init,
+      headers: { ...baseHeaders, ...entry.headers },
+      redirect: "manual",
+    });
   } catch (err) {
     // Outcome unknown: count the spend conservatively and keep the
     // authorization so a retry reuses it (single-use nonce).
@@ -374,8 +389,10 @@ async function sendPaid(
   }
 
   if (response.status === 402) {
-    // Payment rejected (invalid/expired). Nothing was charged.
+    // Payment rejected (invalid/expired). Nothing was charged — unless an
+    // earlier attempt with this authorization already counted as spent.
     ledger.delete(key);
+    if (!entry.recorded) options.guard?.release?.(entry.payment);
     return { response };
   }
 

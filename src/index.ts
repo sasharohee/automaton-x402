@@ -322,7 +322,7 @@ async function run(): Promise<void> {
     blockrunFetch = createBlockRunPaymentFetch({ config, account, spendTracker }).fetch;
     blockrunApiUrl = blockrun.apiUrl;
     logger.info(
-      `[${new Date().toISOString()}] BlockRun models: normal=${blockrun.models.normal} low=${blockrun.models.lowCompute} critical=${blockrun.models.critical} | caps: $${(treasuryPolicy.maxInferenceDailyCents / 100).toFixed(2)}/day, $${(treasuryPolicy.maxX402PaymentCents / 100).toFixed(2)}/request, reserve $${(treasuryPolicy.minimumReserveCents / 100).toFixed(2)}`,
+      `[${new Date().toISOString()}] BlockRun models: high=${blockrun.models.high || blockrun.models.normal} normal=${blockrun.models.normal} low=${blockrun.models.lowCompute} critical=${blockrun.models.critical} | caps: $${(treasuryPolicy.maxTotalDailySpendCents / 100).toFixed(2)}/day total, $${(treasuryPolicy.maxInferenceDailyCents / 100).toFixed(2)}/day inference, $${(treasuryPolicy.maxX402PaymentCents / 100).toFixed(2)}/request, reserve $${(treasuryPolicy.minimumReserveCents / 100).toFixed(2)}`,
     );
   }
 

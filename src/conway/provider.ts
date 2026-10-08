@@ -76,6 +76,10 @@ export const STANDALONE_DISABLED_TOOLS: ReadonlySet<string> = new Set([
   "message_child",
   "verify_child_constitution",
   "prune_dead_children",
+  // Upstream code updates (would overwrite the standalone guardrails)
+  "pull_upstream",
+  "reset_to_upstream",
+  "review_upstream_changes",
 ]);
 
 /** Tools that can never run in standalone mode, even if requested directly. */
@@ -83,6 +87,9 @@ export const STANDALONE_FORBIDDEN_TOOLS: ReadonlySet<string> = new Set([
   "spawn_child",
   "fund_child",
   "transfer_credits",
+  "pull_upstream",
+  "reset_to_upstream",
+  "review_upstream_changes",
 ]);
 
 export function filterToolsForProvider<T extends Pick<AutomatonTool, "name">>(

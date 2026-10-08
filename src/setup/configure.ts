@@ -281,6 +281,7 @@ async function configureTreasury(config: AutomatonConfig): Promise<void> {
   t.minimumReserveCents = await askNumber("Minimum reserve", t.minimumReserveCents);
   t.maxX402PaymentCents = await askNumber("Max x402 payment", t.maxX402PaymentCents);
   t.maxInferenceDailyCents = await askNumber("Max daily inference spend", t.maxInferenceDailyCents);
+  t.maxTotalDailySpendCents = await askNumber("Max total daily spend (all categories)", t.maxTotalDailySpendCents);
   t.requireConfirmationAboveCents = await askNumber(
     "Require confirmation above",
     t.requireConfirmationAboveCents,

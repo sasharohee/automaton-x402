@@ -84,6 +84,7 @@ function makeGuard(refusal: string | null = null) {
   return {
     authorize: vi.fn(async () => refusal),
     record: vi.fn(),
+    release: vi.fn(),
   } satisfies X402SpendGuard;
 }
 
@@ -242,7 +243,7 @@ describe("x402PaidFetch", () => {
       x402PaidFetch("https://evil.example/pay", postInit(), {
         account: TEST_ACCOUNT,
         fetchImpl,
-        allowedDomains: ["blockrun.ai", "api.fluence.dev"],
+        allowedDomains: ["blockrun.ai"],
       }),
     ).rejects.toMatchObject({ code: "DOMAIN_NOT_ALLOWED" });
     expect(fetchImpl).toHaveBeenCalledTimes(1);
@@ -314,7 +315,76 @@ describe("x402PaidFetch", () => {
     });
     expect(response.status).toBe(402);
     expect(guard.record).not.toHaveBeenCalled();
+    expect(guard.release).toHaveBeenCalledTimes(1);
     expect(ledger.size).toBe(0);
+  });
+});
+
+describe("redirects never carry a signed payment", () => {
+  const redirectTo = (location: string) =>
+    new Response(null, { status: 302, headers: { Location: location } });
+
+  it("sends both the probe and the paid request with redirect: manual", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(challengeResponse())
+      .mockResolvedValueOnce(paidResponse());
+    await x402PaidFetch(URL_BLOCKRUN, postInit(), {
+      account: TEST_ACCOUNT,
+      fetchImpl,
+      allowedDomains: ["blockrun.ai"],
+      ledger: new PaymentLedger(),
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(fetchImpl.mock.calls[0][1].redirect).toBe("manual");
+    expect(fetchImpl.mock.calls[1][1].redirect).toBe("manual");
+    expect(headerOf(fetchImpl.mock.calls[1][1], "PAYMENT-SIGNATURE")).toBeTruthy();
+  });
+
+  it("does not follow a redirect to another host after payment", async () => {
+    const fetchImpl = vi
+      .fn()
+      .mockResolvedValueOnce(challengeResponse())
+      .mockResolvedValueOnce(redirectTo("https://evil.example/steal"));
+    const { response } = await x402PaidFetch(URL_BLOCKRUN, postInit(), {
+      account: TEST_ACCOUNT,
+      fetchImpl,
+      allowedDomains: ["blockrun.ai"],
+      ledger: new PaymentLedger(),
+    });
+    expect(response.status).toBe(302);
+    // Only blockrun.ai was ever contacted.
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    for (const call of fetchImpl.mock.calls) {
+      expect(new URL(call[0]).hostname).toBe("blockrun.ai");
+    }
+  });
+
+  it("does not pay a challenge reached through a redirect", async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(redirectTo("https://evil.example/pay"));
+    const guard = makeGuard();
+    const { response, payment } = await x402PaidFetch(URL_BLOCKRUN, postInit(), {
+      account: TEST_ACCOUNT,
+      fetchImpl,
+      guard,
+      allowedDomains: ["blockrun.ai"],
+    });
+    expect(response.status).toBe(302);
+    expect(payment).toBeUndefined();
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(guard.authorize).not.toHaveBeenCalled();
+  });
+
+  it("legacy x402Fetch tool path also uses redirect: manual", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(challengeResponse())
+      .mockResolvedValueOnce(paidResponse({ ok: 1 }));
+    vi.stubGlobal("fetch", fetchMock);
+    await x402Fetch(URL_BLOCKRUN, TEST_ACCOUNT, "POST", "{}", undefined, 10, "evm", {
+      allowedDomains: ["blockrun.ai"],
+    });
+    for (const call of fetchMock.mock.calls) expect(call[1].redirect).toBe("manual");
   });
 });
 

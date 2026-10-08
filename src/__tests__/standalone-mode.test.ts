@@ -45,6 +45,8 @@ import {
 } from "../types.js";
 import { createTestConfig, createTestDb, createTestIdentity, MockConwayClient, MockInferenceClient } from "./mocks.js";
 
+const UPSTREAM_TOOLS = ["pull_upstream", "reset_to_upstream", "review_upstream_changes"];
+
 const standaloneConfig = (overrides = {}) =>
   createTestConfig({
     providerMode: "standalone",
@@ -149,6 +151,14 @@ describe("tool availability in standalone mode", () => {
     expect(names.has("x402_fetch")).toBe(true);
   });
 
+  it("does not offer the upstream code-update tools", () => {
+    const names = new Set(filterToolsForProvider(createBuiltinTools(""), standaloneConfig()).map((t) => t.name));
+    for (const name of UPSTREAM_TOOLS) {
+      expect(STANDALONE_DISABLED_TOOLS.has(name)).toBe(true);
+      expect(names.has(name)).toBe(false);
+    }
+  });
+
   it("keeps every tool in Conway mode", () => {
     const all = createBuiltinTools("sbx");
     expect(filterToolsForProvider(all, createTestConfig())).toHaveLength(all.length);
@@ -196,6 +206,16 @@ describe("policy: spawn / fund / transfer refused", () => {
     const { result, transferSpy } = await run(tool, args);
     expect(result.error).toMatch(/Policy denied/);
     expect(transferSpy).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["pull_upstream", {}],
+    ["reset_to_upstream", {}],
+    ["review_upstream_changes", {}],
+  ])("denies %s in standalone mode (policy engine)", async (tool, args) => {
+    const { result } = await run(tool, args);
+    expect(result.error).toMatch(/Policy denied/);
+    expect(result.error).toMatch(/PROVIDER_UNSUPPORTED/);
   });
 
   it("denies spawn_child whenever maxChildren is 0 (default)", async () => {
@@ -387,7 +407,7 @@ describe("standalone configuration defaults", () => {
     expect(cfg.treasuryPolicy?.maxInferenceDailyCents).toBe(200);
     expect(cfg.treasuryPolicy?.maxX402PaymentCents).toBe(10);
     expect(cfg.treasuryPolicy?.maxSingleTransferCents).toBe(500);
-    expect(cfg.treasuryPolicy?.x402AllowedDomains).toEqual(["blockrun.ai", "api.fluence.dev"]);
+    expect(cfg.treasuryPolicy?.x402AllowedDomains).toEqual(["blockrun.ai"]);
   });
 
   it("replication is off by default in Conway mode too", () => {
@@ -432,7 +452,7 @@ describe("standalone configuration defaults", () => {
       expect(cfg.inferenceModel).toBe("big-model");
       expect(cfg.modelStrategy?.lowComputeModel).toBe("deepseek-chat");
       expect(cfg.treasuryPolicy?.maxInferenceDailyCents).toBe(200);
-      expect(cfg.treasuryPolicy?.x402AllowedDomains).toEqual(["blockrun.ai", "api.fluence.dev"]);
+      expect(cfg.treasuryPolicy?.x402AllowedDomains).toEqual(["blockrun.ai"]);
     } finally {
       process.env.HOME = prevHome;
       vi.resetModules();
@@ -475,5 +495,120 @@ describe("state repo never commits secrets", () => {
     const cmd = execSpy.mock.calls.map((c) => c[0]).join("\n");
     expect(cmd).toContain("git rm -r --cached --ignore-unmatch");
     expect(cmd).toContain("'automaton.json'");
+  });
+});
+
+// ─── Guardrails vs self-modification ──────────────────────────
+
+describe("spending guardrails are protected from self-modification", () => {
+  it.each([
+    "src/survival/spend-guard.ts",
+    "dist/survival/spend-guard.js",
+    "src/conway/x402-v2.ts",
+    "src/conway/x402.ts",
+    "src/conway/provider.ts",
+    "dist/conway/provider.js",
+    "src/agent/policy-rules/provider-mode.ts",
+    "src/agent/policy-rules/financial.ts",
+    "src/agent/spend-tracker.ts",
+    "src/types.ts",
+    "src/config.ts",
+    "dist/config.js",
+    "src/setup/wizard.ts",
+  ])("%s is in PROTECTED_FILES", async (file) => {
+    const { isProtectedFile } = await import("../self-mod/code.js");
+    expect(isProtectedFile(path.join("/home/agent/automaton", file))).toBe(true);
+  });
+
+  it("refuses to write the spend guard through editFile", async () => {
+    const { editFile } = await import("../self-mod/code.js");
+    const conway = new MockConwayClient();
+    const writeSpy = vi.spyOn(conway, "writeFile");
+    const db = createTestDb();
+    try {
+      const result = await editFile(
+        conway,
+        db,
+        path.join("/home/agent/automaton", "src/survival/spend-guard.ts"),
+        "export {}",
+        "lift the caps",
+      );
+      expect(result.success).toBe(false);
+      expect(writeSpy).not.toHaveBeenCalled();
+    } finally {
+      db.close();
+    }
+  });
+
+  it("does not over-match unrelated files", async () => {
+    const { isProtectedFile } = await import("../self-mod/code.js");
+    expect(isProtectedFile("/home/agent/automaton/src/heartbeat/config.ts")).toBe(false);
+    expect(isProtectedFile("/home/agent/automaton/src/skills/my-skill.ts")).toBe(false);
+  });
+});
+
+// ─── Global daily cap default ─────────────────────────────────
+
+describe("global daily spend cap", () => {
+  it("defaults to $2/day for all categories combined in standalone mode", () => {
+    expect(STANDALONE_TREASURY_POLICY.maxTotalDailySpendCents).toBe(200);
+    expect(resolveTreasuryPolicy(standaloneConfig()).maxTotalDailySpendCents).toBe(200);
+  });
+
+  it("is configurable", () => {
+    const p = resolveTreasuryPolicy({
+      providerMode: "standalone",
+      treasuryPolicy: { maxTotalDailySpendCents: 50 } as any,
+    });
+    expect(p.maxTotalDailySpendCents).toBe(50);
+  });
+});
+
+// ─── Provisioning guard ───────────────────────────────────────
+
+describe("Conway provisioning guard", () => {
+  const withHome = async (
+    configJson: unknown,
+    envMode: string | undefined,
+    fn: (mod: typeof import("../identity/provision.js")) => Promise<void>,
+  ) => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "automaton-home-"));
+    fs.mkdirSync(path.join(home, ".automaton"));
+    if (configJson !== undefined) {
+      fs.writeFileSync(path.join(home, ".automaton", "automaton.json"), JSON.stringify(configJson));
+    }
+    const prevHome = process.env.HOME;
+    const prevMode = process.env.AUTOMATON_PROVIDER_MODE;
+    process.env.HOME = home;
+    if (envMode === undefined) delete process.env.AUTOMATON_PROVIDER_MODE;
+    else process.env.AUTOMATON_PROVIDER_MODE = envMode;
+    vi.resetModules();
+    try {
+      await fn(await import("../identity/provision.js"));
+    } finally {
+      process.env.HOME = prevHome;
+      if (prevMode === undefined) delete process.env.AUTOMATON_PROVIDER_MODE;
+      else process.env.AUTOMATON_PROVIDER_MODE = prevMode;
+      vi.resetModules();
+    }
+  };
+
+  it("refuses to provision when the config file says standalone (no env var)", async () => {
+    await withHome({ providerMode: "standalone" }, undefined, async ({ provision, isStandaloneConfigured }) => {
+      expect(isStandaloneConfigured()).toBe(true);
+      await expect(provision("https://conway.invalid")).rejects.toThrow(/standalone/);
+    });
+  });
+
+  it("refuses to provision when the env var says standalone", async () => {
+    await withHome(undefined, "standalone", async ({ isStandaloneConfigured }) => {
+      expect(isStandaloneConfigured()).toBe(true);
+    });
+  });
+
+  it("allows Conway mode", async () => {
+    await withHome({ providerMode: "conway" }, undefined, async ({ isStandaloneConfigured }) => {
+      expect(isStandaloneConfigured()).toBe(false);
+    });
   });
 });

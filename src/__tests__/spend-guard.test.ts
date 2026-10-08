@@ -117,3 +117,145 @@ describe("SpendGuard", () => {
     expect(reader).toHaveBeenCalledTimes(1);
   });
 });
+
+/** Insert spend recorded earlier today (never matches the current hour window). */
+function seedEarlierToday(db: AutomatonDatabase, category: string, amountCents: number, id: string) {
+  const today = new Date().toISOString().slice(0, 10);
+  db.raw
+    .prepare(
+      "INSERT INTO spend_tracking (id, tool_name, amount_cents, category, window_hour, window_day) VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .run(id, "t", amountCents, category, `${today}T-earlier`, today);
+}
+
+describe("global daily cap (all categories combined)", () => {
+  let db: AutomatonDatabase;
+  let tracker: SpendTracker;
+
+  beforeEach(() => {
+    db = createTestDb();
+    tracker = new SpendTracker(db.raw);
+  });
+
+  afterEach(() => {
+    db.close();
+  });
+
+  const guardFor = (category: "inference" | "x402", overrides: Partial<TreasuryPolicy> = {}) =>
+    new SpendGuard({
+      policy: { ...policy, ...overrides },
+      category,
+      spendTracker: tracker,
+      getBalanceCents: async () => 100_000,
+    });
+
+  it("caps x402_fetch at $2/day, not the $5/day x402 envelope", async () => {
+    // Before the fix, x402 had its own 50 × $0.10 = $5/day envelope.
+    seedEarlierToday(db, "x402", 195, "x-1");
+    const guard = guardFor("x402");
+    expect(await guard.authorize({ amountCents: 5, host: "blockrun.ai" })).toBeNull();
+    expect(await guard.authorize({ amountCents: 1, host: "blockrun.ai" })).toMatch(/Global daily spend cap/);
+  });
+
+  it("counts inference and x402 spend together", async () => {
+    seedEarlierToday(db, "inference", 120, "i-1");
+    seedEarlierToday(db, "x402", 75, "x-1");
+    // Each category is well under its own cap, but together they hit $2.
+    expect(await guardFor("x402").authorize({ amountCents: 5, host: "blockrun.ai" })).toBeNull();
+    expect(await guardFor("inference").authorize({ amountCents: 1, host: "blockrun.ai" })).toMatch(
+      /Global daily spend cap/,
+    );
+  });
+
+  it("also applies to transfers checked by the policy engine", () => {
+    seedEarlierToday(db, "inference", 190, "i-1");
+    const check = tracker.checkLimit(20, "transfer", policy);
+    expect(check.allowed).toBe(false);
+    expect(check.reason).toMatch(/Global daily spend cap/);
+  });
+
+  it("is configurable", async () => {
+    seedEarlierToday(db, "x402", 195, "x-1");
+    const guard = guardFor("x402", { maxTotalDailySpendCents: 1_000 });
+    expect(await guard.authorize({ amountCents: 10, host: "blockrun.ai" })).toBeNull();
+  });
+});
+
+describe("atomic check + record (reservation)", () => {
+  let db: AutomatonDatabase;
+  let tracker: SpendTracker;
+
+  beforeEach(() => {
+    db = createTestDb();
+    tracker = new SpendTracker(db.raw);
+  });
+
+  afterEach(() => {
+    db.close();
+  });
+
+  /** Balance read that resolves later, so concurrent callers interleave. */
+  const slowBalance = () => new Promise<number>((resolve) => setTimeout(() => resolve(100_000), 5));
+
+  it("parallel payments through one guard cannot exceed the cap", async () => {
+    const guard = new SpendGuard({
+      policy: { ...policy, maxTotalDailySpendCents: 50 },
+      category: "x402",
+      spendTracker: tracker,
+      getBalanceCents: slowBalance,
+    });
+    const results = await Promise.all(
+      Array.from({ length: 20 }, () => guard.authorize({ amountCents: 10, host: "blockrun.ai" })),
+    );
+    expect(results.filter((r) => r === null)).toHaveLength(5);
+    expect(tracker.getTotalDailySpend()).toBe(50);
+  });
+
+  it("parallel workers with separate guards sharing the ledger cannot exceed the cap", async () => {
+    // x402_fetch builds a fresh SpendGuard per call: only the DB is shared.
+    const workers = Array.from(
+      { length: 12 },
+      () =>
+        new SpendGuard({
+          policy: { ...policy, maxTotalDailySpendCents: 30 },
+          category: "x402",
+          spendTracker: tracker,
+          getBalanceCents: slowBalance,
+        }),
+    );
+    const results = await Promise.all(workers.map((g) => g.authorize({ amountCents: 10, host: "blockrun.ai" })));
+    expect(results.filter((r) => r === null)).toHaveLength(3);
+    expect(tracker.getTotalDailySpend()).toBe(30);
+  });
+
+  it("records the spend at authorization; record() does not double count", async () => {
+    const guard = new SpendGuard({ policy, category: "x402", spendTracker: tracker, getBalanceCents: async () => 1000 });
+    expect(await guard.authorize({ amountCents: 4, host: "blockrun.ai" })).toBeNull();
+    expect(tracker.getDailySpend("x402")).toBe(4);
+    guard.record({ amountCents: 4, host: "blockrun.ai", settled: true });
+    expect(tracker.getDailySpend("x402")).toBe(4);
+  });
+
+  it("release() cancels a reservation that was not charged", async () => {
+    const guard = new SpendGuard({ policy, category: "x402", spendTracker: tracker, getBalanceCents: async () => 105 });
+    expect(await guard.authorize({ amountCents: 5, host: "blockrun.ai" })).toBeNull();
+    // Reserve is now exhausted by the pending reservation...
+    expect(await guard.authorize({ amountCents: 1, host: "blockrun.ai" })).toMatch(/reserve/);
+    guard.release({ amountCents: 5, host: "blockrun.ai" });
+    expect(tracker.getDailySpend("x402")).toBe(0);
+    // ...and freed again once released.
+    expect(await guard.authorize({ amountCents: 1, host: "blockrun.ai" })).toBeNull();
+  });
+
+  it("reserveSpend is a single transaction (check and insert together)", () => {
+    const limits = { ...policy, maxTotalDailySpendCents: 10 };
+    const first = tracker.reserveSpend({ toolName: "t", amountCents: 10, category: "x402" }, limits);
+    expect(first.allowed).toBe(true);
+    expect(first.reservationId).toBeTruthy();
+    const second = tracker.reserveSpend({ toolName: "t", amountCents: 1, category: "x402" }, limits);
+    expect(second.allowed).toBe(false);
+    expect(second.reservationId).toBeUndefined();
+    tracker.releaseSpend(first.reservationId!);
+    expect(tracker.getTotalDailySpend()).toBe(0);
+  });
+});

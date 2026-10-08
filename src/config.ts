@@ -57,17 +57,18 @@ export function loadConfig(): AutomatonConfig | null {
     const apiKey = raw.conwayApiKey || (standalone ? "" : loadApiKeyFromConfig()) || "";
 
     // Deep-merge treasury policy with mode-appropriate defaults
+    const policyDefaults = standalone ? STANDALONE_TREASURY_POLICY : DEFAULT_TREASURY_POLICY;
     const treasuryPolicy: TreasuryPolicy = {
-      ...(standalone ? STANDALONE_TREASURY_POLICY : DEFAULT_TREASURY_POLICY),
+      ...policyDefaults,
       ...(raw.treasuryPolicy ?? {}),
     };
 
     // Validate all treasury values are positive numbers
     for (const [key, value] of Object.entries(treasuryPolicy)) {
       if (key === "x402AllowedDomains") continue; // array, not number
-      if (typeof value === "number" && (value < 0 || !Number.isFinite(value))) {
+      if (typeof value !== "number" || value < 0 || !Number.isFinite(value)) {
         logger.warn(`Invalid treasury value for ${key}: ${value}, using default`);
-        (treasuryPolicy as any)[key] = (DEFAULT_TREASURY_POLICY as any)[key];
+        (treasuryPolicy as any)[key] = (policyDefaults as any)[key];
       }
     }
 

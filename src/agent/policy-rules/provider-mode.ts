@@ -13,7 +13,7 @@ import { STANDALONE_FORBIDDEN_TOOLS, isStandalone } from "../../conway/provider.
 function createStandaloneForbiddenRule(): PolicyRule {
   return {
     id: "provider.standalone_forbidden",
-    description: "Deny spawn/fund/transfer tools in standalone (no Conway) mode",
+    description: "Deny spawn/fund/transfer and upstream-update tools in standalone (no Conway) mode",
     priority: 100,
     appliesTo: { by: "name", names: [...STANDALONE_FORBIDDEN_TOOLS] },
     evaluate(request: PolicyRequest): PolicyRuleResult | null {
@@ -22,7 +22,7 @@ function createStandaloneForbiddenRule(): PolicyRule {
         rule: "provider.standalone_forbidden",
         action: "deny",
         reasonCode: "PROVIDER_UNSUPPORTED",
-        humanMessage: `${request.tool.name} is disabled in standalone mode (no Conway credits, no replication).`,
+        humanMessage: `${request.tool.name} is disabled in standalone mode (no Conway credits, no replication, no upstream code updates).`,
       };
     },
   };

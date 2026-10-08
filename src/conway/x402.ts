@@ -432,6 +432,7 @@ export async function x402Fetch(
         parsed.x402Version,
       );
     } catch (err: any) {
+      options?.guard?.release?.(paymentInfo);
       return {
         success: false,
         error: `Failed to sign payment: ${err?.message || String(err)}`,
@@ -454,6 +455,8 @@ export async function x402Fetch(
         },
         body,
         retries: 0, // Paid request: do not auto-retry (payment already signed)
+        // Never follow redirects with the signed X-Payment header.
+        redirect: "manual",
       });
     } catch (err) {
       // Outcome unknown: count the spend conservatively.
@@ -462,6 +465,7 @@ export async function x402Fetch(
     }
     const paid = paidResp.status !== 402;
     if (paid) options?.guard?.record({ ...paymentInfo, settled: paidResp.ok });
+    else options?.guard?.release?.(paymentInfo);
 
     const data = await paidResp.json().catch(() => paidResp.text());
     return {

@@ -96,13 +96,15 @@ export async function runSetupWizard(): Promise<AutomatonConfig> {
     console.log(chalk.white("  BlockRun inference models (paid per call in USDC via x402)."));
     console.log(chalk.dim("  Pick tool-capable models. List: GET https://blockrun.ai/api/v1/models\n"));
     const defaults = DEFAULT_BLOCKRUN_CONFIG.models;
+    console.log(chalk.dim(`  low_compute and critical stay on ${defaults.lowCompute} (cheapest). A stronger model for`));
+    console.log(chalk.dim("  normal/high costs more per call but still counts against the daily cap.\n"));
     const normal = (await promptOptional(`Model for the normal tier [${defaults.normal}]`)) || defaults.normal;
-    const lowCompute = (await promptOptional(`Cheap model for low_compute/critical tiers [${defaults.lowCompute}]`)) || defaults.lowCompute;
+    const high = (await promptOptional(`Model for the high tier [${defaults.high || normal}]`)) || defaults.high || normal;
     blockrun = {
       apiUrl: DEFAULT_BLOCKRUN_CONFIG.apiUrl,
-      models: { normal, lowCompute, critical: lowCompute },
+      models: { high, normal, lowCompute: defaults.lowCompute, critical: defaults.critical },
     };
-    console.log(chalk.green(`  Models: normal=${normal}, low/critical=${lowCompute}\n`));
+    console.log(chalk.green(`  Models: high=${high}, normal=${normal}, low/critical=${defaults.lowCompute}\n`));
   } else {
     ({ openaiApiKey, anthropicApiKey, ollamaBaseUrl } = await promptProviderKeys());
   }
@@ -113,6 +115,8 @@ export async function runSetupWizard(): Promise<AutomatonConfig> {
 
   const treasuryPolicy: TreasuryPolicy = standalone ? {
     ...STANDALONE_TREASURY_POLICY,
+    maxTotalDailySpendCents: await promptWithDefault(
+      "Max total daily spend, all payments combined (cents)", STANDALONE_TREASURY_POLICY.maxTotalDailySpendCents),
     maxInferenceDailyCents: await promptWithDefault(
       "Max daily inference spend (cents)", STANDALONE_TREASURY_POLICY.maxInferenceDailyCents),
     maxX402PaymentCents: await promptWithDefault(
@@ -137,6 +141,8 @@ export async function runSetupWizard(): Promise<AutomatonConfig> {
     maxTransfersPerTurn: DEFAULT_TREASURY_POLICY.maxTransfersPerTurn,
     maxInferenceDailyCents: await promptWithDefault(
       "Max daily inference spend (cents)", DEFAULT_TREASURY_POLICY.maxInferenceDailyCents),
+    maxTotalDailySpendCents: await promptWithDefault(
+      "Max total daily spend, all categories (cents)", DEFAULT_TREASURY_POLICY.maxTotalDailySpendCents),
     requireConfirmationAboveCents: await promptWithDefault(
       "Require confirmation above (cents)", DEFAULT_TREASURY_POLICY.requireConfirmationAboveCents),
   };
@@ -298,7 +304,7 @@ function showStandaloneFundingPanel(address: string, policy: TreasuryPolicy): vo
   console.log(chalk.cyan(`  │${pad(`  ${address}`, w)}│`));
   console.log(chalk.cyan(`  │${" ".repeat(w)}│`));
   console.log(chalk.cyan(`  │${pad("  No ETH needed: x402 uses gasless EIP-3009 signatures.", w)}│`));
-  console.log(chalk.cyan(`  │${pad(`  Caps: ${usd(policy.maxInferenceDailyCents)}/day, ${usd(policy.maxX402PaymentCents)}/request`, w)}│`));
+  console.log(chalk.cyan(`  │${pad(`  Caps: ${usd(policy.maxTotalDailySpendCents)}/day total, ${usd(policy.maxX402PaymentCents)}/request`, w)}│`));
   console.log(chalk.cyan(`  │${pad(`  Reserve never spent: ${usd(policy.minimumReserveCents)}`, w)}│`));
   console.log(chalk.cyan(`  ${"╰" + "─".repeat(w) + "╯"}`));
   console.log("");

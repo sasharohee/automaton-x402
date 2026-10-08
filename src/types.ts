@@ -592,6 +592,17 @@ export interface SpendTrackerInterface {
   getTotalSpend(category: SpendCategory, since: Date): number;
   checkLimit(amount: number, category: SpendCategory, limits: TreasuryPolicy): LimitCheckResult;
   pruneOldRecords(retentionDays: number): number;
+  /** Spend recorded today across all categories. */
+  getTotalDailySpend?(): number;
+  /** Atomically check limits and record the spend (see SpendTracker). */
+  reserveSpend?(entry: SpendEntry, limits: TreasuryPolicy): SpendReservationResult;
+  /** Cancel a reservation returned by reserveSpend. */
+  releaseSpend?(reservationId: string): void;
+}
+
+export interface SpendReservationResult extends LimitCheckResult {
+  /** Set when the spend was reserved (allowed === true). */
+  reservationId?: string;
 }
 
 export interface SpendEntry {
@@ -621,6 +632,11 @@ export interface TreasuryPolicy {
   transferCooldownMs: number;
   maxTransfersPerTurn: number;
   maxInferenceDailyCents: number;
+  /**
+   * Global cap on everything spent in a UTC day, all categories combined
+   * (inference + x402 + transfers + other), on top of per-category caps.
+   */
+  maxTotalDailySpendCents: number;
   requireConfirmationAboveCents: number;
 }
 
@@ -634,6 +650,8 @@ export const DEFAULT_TREASURY_POLICY: TreasuryPolicy = {
   transferCooldownMs: 0,
   maxTransfersPerTurn: 2,
   maxInferenceDailyCents: 50000,
+  // Conway mode: sum of the per-category daily caps (no behaviour change).
+  maxTotalDailySpendCents: 80000,
   requireConfirmationAboveCents: 1000,
 };
 
@@ -647,10 +665,12 @@ export const STANDALONE_TREASURY_POLICY: TreasuryPolicy = {
   maxDailyTransferCents: 500,
   minimumReserveCents: 100, // $1 kept untouched in the wallet
   maxX402PaymentCents: 10, // $0.10 per request
-  x402AllowedDomains: ["blockrun.ai", "api.fluence.dev"],
+  // Fluence (phase 2) is not implemented yet: not allowed to be paid.
+  x402AllowedDomains: ["blockrun.ai"],
   transferCooldownMs: 0,
   maxTransfersPerTurn: 1,
   maxInferenceDailyCents: 200, // $2 / day
+  maxTotalDailySpendCents: 200, // $2 / day, all categories combined
   requireConfirmationAboveCents: 100,
 };
 
