@@ -1,7 +1,10 @@
 import type { Goal, TaskNode } from "./task-graph.js";
 import { UnifiedInferenceClient } from "../inference/inference-client.js";
 import type { ModelTier } from "../inference/provider-registry.js";
-import { STANDALONE_PLANNER_NOTICE } from "../agent/standalone-notice.js";
+import {
+  buildStandalonePlannerNotice,
+  type PublicServiceNoticeConfig,
+} from "../agent/standalone-notice.js";
 
 export interface PlannerOutput {
   analysis: string;
@@ -54,6 +57,8 @@ export interface PlannerContext {
   workspaceFiles: string[];
   /** Standalone mode (no Conway): no inbound connectivity, one local worker. */
   standalone?: boolean;
+  /** Standalone only: the single public HTTP service port, when configured. */
+  publicService?: PublicServiceNoticeConfig;
 }
 
 export interface PlannerGoalInput {
@@ -134,7 +139,9 @@ async function runPlannerInference(params: {
 }): Promise<PlannerOutput> {
   const standalone = params.context.standalone === true;
   const basePrompt = buildPlannerPrompt(params.context);
-  const systemPrompt = standalone ? `${basePrompt}\n\n${STANDALONE_PLANNER_NOTICE}` : basePrompt;
+  const systemPrompt = standalone
+    ? `${basePrompt}\n\n${buildStandalonePlannerNotice(params.context.publicService)}`
+    : basePrompt;
   const userPrompt = buildPlannerUserPrompt({
     mode: params.mode,
     goal: params.goal,

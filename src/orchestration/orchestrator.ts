@@ -2,6 +2,7 @@ import type { Database } from "better-sqlite3";
 import { ulid } from "ulid";
 import type { AutomatonIdentity } from "../types.js";
 import { isStandalone } from "../conway/provider.js";
+import { getPublicService } from "../agent/public-service.js";
 import { createLogger } from "../observability/logger.js";
 import {
   assignTask,
@@ -427,6 +428,7 @@ export class Orchestrator {
           busyAgents: Math.max(0, this.getActiveAgentCount() - this.params.agentTracker.getIdle().length),
           maxAgents: Number(this.params.config?.maxChildren ?? 3),
           standalone: this.isStandalone(),
+          publicService: getPublicService(this.params.config),
         }),
         this.params.inference,
       );
@@ -462,7 +464,8 @@ export class Orchestrator {
 
     if (output.tasks.length === 0 && this.isStandalone()) {
       // Standalone: an empty plan means the goal is infeasible here (e.g. it
-      // needs inbound connectivity).
+      // needs inbound connectivity, or more than the single public service
+      // port when publicService is configured).
       return this.failGoal(state, goal.id, `Planner found the goal infeasible: ${output.analysis}`);
     }
 
@@ -772,6 +775,7 @@ export class Orchestrator {
           busyAgents: Math.max(0, this.getActiveAgentCount() - this.params.agentTracker.getIdle().length),
           maxAgents: Number(this.params.config?.maxChildren ?? 3),
           standalone: this.isStandalone(),
+          publicService: getPublicService(this.params.config),
         }),
         this.params.inference,
       );

@@ -70,6 +70,8 @@ import { isStandalone, filterToolsForProvider, resolveBlockRunConfig } from "../
 import { buildRoutingMatrix, registerMappedModels } from "../inference/model-map.js";
 import { scheduleIdleSleep, resetIdleBackoff } from "./idle-backoff.js";
 import { ensureStandaloneWorkDir } from "./workdir.js";
+import { buildStandaloneEarningGuidance } from "./standalone-notice.js";
+import { getPublicService, probeLocalPort } from "./public-service.js";
 
 const logger = createLogger("loop");
 const MAX_TOOL_CALLS_PER_TURN = 10;
@@ -100,14 +102,6 @@ const MUTATING_TOOLS = new Set([
   "enter_low_compute", "switch_model", "review_upstream_changes",
 ]);
 
-const STANDALONE_EARNING_GUIDANCE =
-  `You have NO inbound connectivity: no public IP, no open port, no domain. A server you start is only ` +
-  `reachable from localhost on your own machine — nobody can call it or pay you through it, so do not build ` +
-  `one to earn money and never claim a service is "live". Earn only through OUTBOUND requests: find paid ` +
-  `bounties or tasks on the web that you can complete and deliver over outbound HTTP, using the tools you ` +
-  `already have. You have no ETH: do not attempt on-chain transactions that need gas (e.g. register_erc8004). ` +
-  `Every turn costs real money and your balance is already in your system prompt. If you have nothing ` +
-  `concrete to do, call sleep with a long duration (30 minutes or more).`;
 
 export interface AgentLoopOptions {
   identity: AutomatonIdentity;
@@ -137,6 +131,8 @@ export async function runAgentLoop(
     options;
 
   const standalone = isStandalone(config);
+  const publicService = getPublicService(config);
+  const standaloneEarningGuidance = buildStandaloneEarningGuidance(publicService);
   const builtinTools = createBuiltinTools(identity.sandboxId);
   const installedTools = loadInstalledTools(db);
   // Standalone mode: Conway-only tools (sandboxes, ports, domains, credit
@@ -384,6 +380,11 @@ export async function runAgentLoop(
       const recentTurns = trimContext(
         meaningfulTurns.length > 0 ? meaningfulTurns : allTurns.slice(-2),
       );
+      // Public service mode: tell the agent whether its server answers on the
+      // public port (local TCP probe, no inference) so it knows to restart it.
+      const publicServiceListening = publicService
+        ? await probeLocalPort(publicService.servicePort)
+        : undefined;
       const systemPrompt = buildSystemPrompt({
         identity,
         config,
@@ -393,6 +394,7 @@ export async function runAgentLoop(
         tools,
         skills,
         isFirstRun,
+        publicServiceListening,
       });
 
       // Phase 2.2: Pre-turn memory retrieval
@@ -677,7 +679,7 @@ export async function runAgentLoop(
               `status-check tools (${turn.toolCalls.map((tc) => tc.name).join(", ")}). ` +
               `You already know your status. ` +
               (standalone
-                ? STANDALONE_EARNING_GUIDANCE
+                ? standaloneEarningGuidance
                 : `Review your genesis prompt and SOUL.md, then execute a CONCRETE task. ` +
                   `Write code, create a file, register a service, or build something new.`),
           );
@@ -693,7 +695,7 @@ export async function runAgentLoop(
             IDLE_SLEEP_NOTE_KEY,
             `LOOP DETECTED before your last sleep: you called "${currentPattern}" with the same arguments ${MAX_REPETITIVE_TURNS} times in a row. ` +
               `Do not repeat it. Pick ONE concrete task from your genesis prompt and take a DIFFERENT approach.` +
-              (standalone ? ` ${STANDALONE_EARNING_GUIDANCE}` : ""),
+              (standalone ? ` ${standaloneEarningGuidance}` : ""),
           );
           lastToolPatterns = [];
           sleepWithBackoff(`[LOOP] Repetitive pattern detected: ${currentPattern}.`);

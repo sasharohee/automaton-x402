@@ -134,6 +134,22 @@ Other safeguards:
 - **Writable directory.** In standalone mode `write_file` and local workers can only write under `~/work` (created at startup). `~/.automaton`, the rest of `HOME` and the application directory are refused. Conway mode keeps `/root`.
 - **No inbound connectivity.** The system prompt tells the agent that servers it starts are only reachable from localhost, that it has no ETH for gas, and that it should earn only through outbound requests.
 
+### Public service (optional)
+
+If the operator publishes one local port of the container at a public HTTPS URL (for example with a separate ngrok tunnel sharing the container's network), declare it in `automaton.json`:
+
+```json
+{
+  "providerMode": "standalone",
+  "publicService": { "publicUrl": "https://example.ngrok-free.app", "servicePort": 8787 }
+}
+```
+
+- Read only in standalone mode. `publicUrl` must be `https://`; `servicePort` defaults to 8787 and must be in 1024-65535. An invalid block is ignored with a warning, and the agent then stays in "no inbound connectivity" mode.
+- The parent, worker, planner and replanner prompts then say that a server listening on `0.0.0.0:<servicePort>` is public at `<publicUrl>` (the only exposed port). They also tell the agent to sell its work behind an x402 v2 paywall (`@x402/express` + `@x402/evm`, `exact`, `eip155:8453`, Base USDC, `payTo` = its own address, facilitator `https://facilitator.payai.network`). The paywall must run before any inference, and the server must never read `~/.automaton` or the wallet key. The code goes in `~/work/<service>`, and the agent must restart the server after every restart of the agent process.
+- Each parent prompt reports whether `127.0.0.1:<servicePort>` answers. This is a local TCP connection with a 500 ms timeout and uses no inference.
+- The agent never sees the tunnel or its token. No guardrail changes: `x402AllowedDomains` stays `blockrun.ai`, because the facilitator is not paid in x402. `expose_port` stays disabled, writes stay confined to `~/work`, and all caps and the reserve are unchanged.
+
 The legacy Conway mode is unchanged and remains available with `"providerMode": "conway"` (the default for existing configs).
 
 ## How It Works

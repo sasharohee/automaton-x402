@@ -25,7 +25,8 @@ import { getActiveSkillInstructions } from "../skills/loader.js";
 import { getLineageSummary } from "../replication/lineage.js";
 import { sanitizeInput } from "./injection-defense.js";
 import { loadCurrentSoul } from "../soul/model.js";
-import { STANDALONE_MODE_NOTICE } from "./standalone-notice.js";
+import { buildStandaloneModeNotice, buildPublicServiceStatus } from "./standalone-notice.js";
+import { getPublicService } from "./public-service.js";
 
 function getCoreRules(chainType?: string): string {
   const usdcNetwork = chainType === "solana" ? "USDC on Solana" : "USDC on Base";
@@ -562,6 +563,11 @@ export function buildSystemPrompt(params: {
   tools: AutomatonTool[];
   skills?: Skill[];
   isFirstRun: boolean;
+  /**
+   * Public service mode only: whether 127.0.0.1:<servicePort> accepted a TCP
+   * connection just before this prompt was built (undefined = not probed).
+   */
+  publicServiceListening?: boolean;
 }): string {
   const {
     identity,
@@ -572,6 +578,7 @@ export function buildSystemPrompt(params: {
     tools,
     skills,
     isFirstRun,
+    publicServiceListening,
   } = params;
 
   const sections: string[] = [];
@@ -595,7 +602,11 @@ Your chain type is ${chainType}.`,
   );
 
   if (config.providerMode === "standalone") {
-    sections.push(STANDALONE_MODE_NOTICE);
+    const publicService = getPublicService(config);
+    sections.push(buildStandaloneModeNotice(publicService, identity.address));
+    if (publicService && publicServiceListening !== undefined) {
+      sections.push(buildPublicServiceStatus(publicService, publicServiceListening));
+    }
   }
 
   // Layer 3: SOUL.md -- structured soul model injection (Phase 2.1)

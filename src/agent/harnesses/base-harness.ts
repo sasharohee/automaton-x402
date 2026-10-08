@@ -4,6 +4,7 @@ import type { TaskNode, TaskResult } from "../../orchestration/task-graph.js";
 import { LoopDetector } from "../loop-detector.js";
 import { buildStandaloneWorkerNotice } from "../standalone-notice.js";
 import { isStandalone } from "../../conway/provider.js";
+import { getPublicService } from "../public-service.js";
 import type {
   AgentHarness,
   HarnessContext,
@@ -44,14 +45,20 @@ export abstract class BaseHarness implements AgentHarness {
 
   /**
    * The harness system prompt plus, in standalone mode, the provider notice
-   * (no inbound connectivity, outbound-only earning, no ETH, ~/work only).
+   * (no inbound connectivity — or the single public service port when
+   * configured — outbound earning, no ETH, ~/work only).
    */
   composeSystemPrompt(): string {
     const base = this.buildSystemPrompt();
     if (!isStandalone(this.context?.config)) {
       return base;
     }
-    return `${base}\n\n${buildStandaloneWorkerNotice(this.context.allowedEditRoot)}`;
+    const notice = buildStandaloneWorkerNotice(
+      this.context.allowedEditRoot,
+      getPublicService(this.context.config),
+      this.context.config.walletAddress || undefined,
+    );
+    return `${base}\n\n${notice}`;
   }
 
   protected beforeTurn(): void {}
