@@ -42,8 +42,16 @@ import {
   markInboxProcessed,
   markInboxFailed,
   resetInboxToReceived,
+  releaseInboxClaim,
   consumeNextWakeEvent,
 } from "../state/database.js";
+import {
+  BUDGET_SLEEP_UNTIL_KEY,
+  budgetWindowResetAt,
+  formatBudgetSleepLog,
+  getActiveBudgetSleep,
+  getSpendLimitRefusal,
+} from "./budget-sleep.js";
 import type { InboxMessageRow } from "../state/database.js";
 import { ulid } from "ulid";
 import { ModelRegistry } from "../inference/registry.js";
@@ -102,6 +110,34 @@ const MUTATING_TOOLS = new Set([
   "enter_low_compute", "switch_model", "review_upstream_changes",
 ]);
 
+
+/**
+ * Parse a tool call's JSON arguments. An empty string means "no arguments";
+ * anything that is not valid JSON for an object (truncated output, null,
+ * an array, a bare string) is rejected.
+ */
+export function parseToolArguments(
+  raw: unknown,
+): { ok: true; args: Record<string, unknown> } | { ok: false; error: string } {
+  let parsed: unknown;
+  if (raw === undefined || raw === null || (typeof raw === "string" && raw.trim() === "")) {
+    return { ok: true, args: {} };
+  }
+  if (typeof raw === "string") {
+    try {
+      parsed = JSON.parse(raw);
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : String(error) };
+    }
+  } else {
+    parsed = raw;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    const kind = parsed === null ? "null" : Array.isArray(parsed) ? "an array" : typeof parsed;
+    return { ok: false, error: `expected a JSON object, got ${kind}` };
+  }
+  return { ok: true, args: parsed as Record<string, unknown> };
+}
 
 export interface AgentLoopOptions {
   identity: AutomatonIdentity;
@@ -209,6 +245,18 @@ export async function runAgentLoop(
     onStateChange?.("sleeping");
     running = false;
   };
+
+  // A spend cap put the agent to sleep until its window resets: any turn
+  // before then would only be refused again, so go straight back to sleep.
+  const budgetSleepUntil = getActiveBudgetSleep(db);
+  if (budgetSleepUntil) {
+    db.setKV("sleep_until", budgetSleepUntil.toISOString());
+    log(config, `[BUDGET] Spend cap window has not reset yet. Sleeping until ${budgetSleepUntil.toISOString()}.`);
+    db.setAgentState("sleeping");
+    onStateChange?.("sleeping");
+    return;
+  }
+  db.deleteKV(BUDGET_SLEEP_UNTIL_KEY);
 
   // Drain any stale wake events from before this loop started,
   // so they don't re-wake the agent after its first sleep.
@@ -549,13 +597,26 @@ export async function runAgentLoop(
             break;
           }
 
-          let args: Record<string, unknown>;
-          try {
-            args = JSON.parse(tc.function.arguments);
-          } catch (error) {
-            logger.error("Failed to parse tool arguments", error instanceof Error ? error : undefined);
-            args = {};
+          const parsedArgs = parseToolArguments(tc.function.arguments);
+          if (!parsedArgs.ok) {
+            // Truncated or malformed arguments (e.g. the model's output was
+            // cut off): never run the tool with made-up arguments.
+            const error =
+              `Tool arguments were truncated or invalid JSON (${parsedArgs.error}); the tool was NOT run. ` +
+              `Retry with smaller content, e.g. split a large file into several smaller write_file calls.`;
+            turn.toolCalls.push({
+              id: tc.id,
+              name: tc.function.name,
+              arguments: {},
+              result: "",
+              durationMs: 0,
+              error,
+            });
+            log(config, `[TOOL RESULT] ${tc.function.name}: ERROR: ${error}`);
+            callCount++;
+            continue;
           }
+          const args = parsedArgs.args;
 
           log(config, `[TOOL] ${tc.function.name}(${JSON.stringify(args).slice(0, 100)})`);
 
@@ -762,6 +823,24 @@ export async function runAgentLoop(
 
       consecutiveErrors = 0;
     } catch (err: any) {
+      // A spend cap refused the payment: not a turn error. Retrying before
+      // the cap's window resets would only be refused again, so sleep until
+      // then, giving claimed messages back without consuming a retry.
+      const capRefusal = getSpendLimitRefusal(err);
+      if (capRefusal) {
+        if (claimedMessages.length > 0) {
+          releaseInboxClaim(db.raw, claimedMessages.map((m) => m.id));
+        }
+        const until = budgetWindowResetAt(capRefusal.limitType);
+        db.setKV(BUDGET_SLEEP_UNTIL_KEY, until.toISOString());
+        db.setKV("sleep_until", until.toISOString());
+        log(config, formatBudgetSleepLog(capRefusal, until));
+        db.setAgentState("sleeping");
+        onStateChange?.("sleeping");
+        running = false;
+        break;
+      }
+
       consecutiveErrors++;
       log(config, `[ERROR] Turn failed: ${err.message}`);
 

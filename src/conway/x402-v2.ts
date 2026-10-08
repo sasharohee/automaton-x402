@@ -31,6 +31,7 @@ import { x402Client, x402HTTPClient } from "@x402/fetch";
 import type { PaymentRequired, PaymentRequirements } from "@x402/fetch";
 import { ExactEvmScheme } from "@x402/evm/exact/client";
 import type { PrivateKeyAccount } from "viem";
+import type { SpendLimitRefusal } from "../types.js";
 
 export const BASE_NETWORK = "eip155:8453";
 export const BASE_USDC_ADDRESS = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
@@ -50,9 +51,20 @@ export interface X402PaymentInfo {
   network: string;
 }
 
+/** A guard refusal; `limit` is set when a spend cap (not another check) refused. */
+export interface X402GuardRefusal {
+  reason: string;
+  limit?: SpendLimitRefusal;
+}
+
 export interface X402SpendGuard {
   /** Return a refusal reason, or null to allow signing the payment. */
   authorize(payment: X402PaymentInfo): Promise<string | null> | string | null;
+  /**
+   * Same as `authorize()` but with a structured refusal. Used instead of
+   * `authorize()` when implemented (never both for the same payment).
+   */
+  authorizeDetailed?(payment: X402PaymentInfo): Promise<X402GuardRefusal | null> | X402GuardRefusal | null;
   /** Called exactly once per signed authorization that was sent to the server. */
   record(payment: X402PaymentInfo & { settled: boolean; transaction?: string }): void;
   /**
@@ -86,10 +98,37 @@ export class X402PaymentError extends Error {
       | "AMOUNT_EXCEEDS_MAX"
       | "GUARD_REFUSED"
       | "SIGNING_FAILED",
+    /** Set on GUARD_REFUSED when a spend cap refused (hourly, daily, global daily). */
+    readonly limit?: SpendLimitRefusal,
   ) {
     super(message);
     this.name = "X402PaymentError";
   }
+}
+
+// ─── Per-request payment accessor ────────────────────────────────
+
+type SentPayment = X402PaymentInfo & { settled: boolean; transaction?: string };
+
+/**
+ * Payment sent for a given response (or for the error thrown while waiting
+ * for it, e.g. a client-side timeout). Keyed by the object itself, so
+ * concurrent requests can never read each other's payment.
+ */
+const paymentsByResult = new WeakMap<object, SentPayment>();
+
+export function attachX402Payment(target: unknown, payment: SentPayment): void {
+  if (target && typeof target === "object") paymentsByResult.set(target, payment);
+}
+
+/**
+ * The x402 payment signed and sent for this response — or for this error,
+ * when the paid request failed client-side (abort/timeout, network error):
+ * such a payment may still settle, and its spend stays reserved.
+ */
+export function getX402Payment(responseOrError: unknown): SentPayment | undefined {
+  if (!responseOrError || typeof responseOrError !== "object") return undefined;
+  return paymentsByResult.get(responseOrError);
 }
 
 export interface X402FetchResult {
@@ -331,7 +370,10 @@ export async function x402PaidFetch(
     );
   }
 
-  if (options.guard) {
+  if (options.guard?.authorizeDetailed) {
+    const refusal = await options.guard.authorizeDetailed(payment);
+    if (refusal) throw new X402PaymentError(refusal.reason, "GUARD_REFUSED", refusal.limit);
+  } else if (options.guard) {
     const refusal = await options.guard.authorize(payment);
     if (refusal) throw new X402PaymentError(refusal, "GUARD_REFUSED");
   }
@@ -383,8 +425,10 @@ async function sendPaid(
     });
   } catch (err) {
     // Outcome unknown: count the spend conservatively and keep the
-    // authorization so a retry reuses it (single-use nonce).
+    // authorization so a retry reuses it (single-use nonce). The reservation
+    // is kept: the server may settle the payment even if we aborted.
     record(false);
+    attachX402Payment(err, { ...entry.payment, settled: false });
     throw err;
   }
 
@@ -413,7 +457,8 @@ async function sendPaid(
 export function createX402Fetch(options: X402PaymentOptions): typeof fetch {
   const paidFetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
     const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
-    const { response } = await x402PaidFetch(url, init, options);
+    const { response, payment } = await x402PaidFetch(url, init, options);
+    if (payment) attachX402Payment(response, payment);
     if (response.status === 402) {
       throw new X402PaymentError(
         `Payment required by ${new URL(url).hostname} but no x402 v2 challenge could be paid`,

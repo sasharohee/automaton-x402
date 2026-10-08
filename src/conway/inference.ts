@@ -15,6 +15,7 @@ import type {
   InferenceToolDefinition,
 } from "../types.js";
 import { ResilientHttpClient } from "./http-client.js";
+import { attachX402Payment, getX402Payment } from "./x402-v2.js";
 
 const INFERENCE_TIMEOUT_MS = 60_000;
 
@@ -275,12 +276,22 @@ async function chatViaBlockRun(params: {
     clearTimeout(timer);
   }
 
-  if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(`Inference error (blockrun): ${resp.status}: ${text}`);
+  // What this call actually cost (the x402 amount we signed and sent), so
+  // the inference cost ledger matches the USDC that left the wallet.
+  const payment = getX402Payment(resp);
+  try {
+    if (!resp.ok) {
+      const text = await resp.text();
+      throw new Error(`Inference error (blockrun): ${resp.status}: ${text}`);
+    }
+    const result = parseOpenAiCompletion(await resp.json(), params.model);
+    if (payment) result.chargedCents = payment.amountCents;
+    return result;
+  } catch (err) {
+    // Paid but unusable: keep the payment visible to the caller's cost ledger.
+    if (payment) attachX402Payment(err, payment);
+    throw err;
   }
-
-  return parseOpenAiCompletion(await resp.json(), params.model);
 }
 
 function parseOpenAiCompletion(raw: unknown, model: string): InferenceResponse {

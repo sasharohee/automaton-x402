@@ -152,6 +152,7 @@ export class SpendTracker implements SpendTrackerInterface {
       return {
         allowed: false,
         reason: `Hourly spend cap exceeded: current ${currentHourlySpend} + ${amount} > ${limitHourly}`,
+        limitType: "hourly",
         currentHourlySpend,
         currentDailySpend,
         limitHourly,
@@ -163,6 +164,7 @@ export class SpendTracker implements SpendTrackerInterface {
       return {
         allowed: false,
         reason: `Daily spend cap exceeded: current ${currentDailySpend} + ${amount} > ${limitDaily}`,
+        limitType: "daily",
         currentHourlySpend,
         currentDailySpend,
         limitHourly,
@@ -178,10 +180,13 @@ export class SpendTracker implements SpendTrackerInterface {
         return {
           allowed: false,
           reason: `Global daily spend cap exceeded (all categories): current ${totalDailySpend} + ${amount} > ${limitTotal}`,
+          limitType: "global_daily",
           currentHourlySpend,
           currentDailySpend,
           limitHourly,
           limitDaily,
+          currentTotalDailySpend: totalDailySpend,
+          limitTotalDaily: limitTotal,
         };
       }
     }

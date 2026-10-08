@@ -30,6 +30,7 @@ import {
 import { consumeNextWakeEvent, insertWakeEvent } from "./state/database.js";
 import { runAgentLoop } from "./agent/loop.js";
 import { ensureStandaloneWorkDir } from "./agent/workdir.js";
+import { getActiveBudgetSleep } from "./agent/budget-sleep.js";
 import { ModelRegistry } from "./inference/registry.js";
 import { loadSkills } from "./skills/loader.js";
 import { initStateRepo } from "./git/state-versioning.js";
@@ -508,6 +509,11 @@ async function run(): Promise<void> {
         while (slept < sleepMs) {
           await sleep(checkInterval);
           slept += checkInterval;
+
+          // A spend cap keeps the agent asleep until its window resets:
+          // waking earlier would only hit the cap again. Wake events stay
+          // queued and are handled once the window has reset.
+          if (getActiveBudgetSleep(db)) continue;
 
           // Phase 1.1: Check for wake events from wake_events table (atomic consume)
           const wakeEvent = consumeNextWakeEvent(db.raw);

@@ -15,11 +15,12 @@
  */
 
 import type {
+  LimitCheckResult,
   SpendCategory,
   SpendTrackerInterface,
   TreasuryPolicy,
 } from "../types.js";
-import type { X402PaymentInfo, X402SpendGuard } from "../conway/x402-v2.js";
+import type { X402GuardRefusal, X402PaymentInfo, X402SpendGuard } from "../conway/x402-v2.js";
 import { createLogger } from "../observability/logger.js";
 
 const logger = createLogger("spend-guard");
@@ -89,28 +90,38 @@ export class SpendGuard implements X402SpendGuard {
    * is then not sent / not charged; `record()` confirms it.
    */
   async authorize(payment: GuardedPayment): Promise<string | null> {
+    const refusal = await this.authorizeDetailed(payment);
+    return refusal ? refusal.reason : null;
+  }
+
+  /**
+   * `authorize()` with a structured refusal: `limit` is set when an hourly,
+   * daily or global daily cap refused, so callers can wait for the window
+   * to reset instead of retrying.
+   */
+  async authorizeDetailed(payment: GuardedPayment): Promise<X402GuardRefusal | null> {
     const { policy, category, spendTracker } = this.options;
     const amount = payment.amountCents;
 
     if (!Number.isFinite(amount) || amount < 0) {
-      return `Invalid payment amount: ${amount}`;
+      return { reason: `Invalid payment amount: ${amount}` };
     }
 
     if (amount > policy.maxX402PaymentCents) {
-      return `Payment of ${amount.toFixed(4)}¢ exceeds per-request max of ${policy.maxX402PaymentCents}¢`;
+      return { reason: `Payment of ${amount.toFixed(4)}¢ exceeds per-request max of ${policy.maxX402PaymentCents}¢` };
     }
 
     // Cheap pre-check so we don't hit the RPC when a cap is already reached.
     const precheck = spendTracker.checkLimit(amount, category, policy);
     if (!precheck.allowed) {
-      return `${category} spend cap reached: ${precheck.reason}`;
+      return this.capRefusal(precheck, amount);
     }
 
     let balance: number;
     try {
       balance = await this.getBalance();
     } catch (err: any) {
-      return `Wallet balance unavailable, refusing to pay (${err?.message || String(err)})`;
+      return { reason: `Wallet balance unavailable, refusing to pay (${err?.message || String(err)})` };
     }
 
     // ── Critical section: no `await` below, so in-process callers are
@@ -123,7 +134,9 @@ export class SpendGuard implements X402SpendGuard {
         minimumReserveCents: policy.minimumReserveCents,
       })
     ) {
-      return `Payment would breach the wallet reserve: balance ${(balance - this.pendingCents).toFixed(2)}¢ - ${amount.toFixed(4)}¢ < reserve ${policy.minimumReserveCents}¢`;
+      return {
+        reason: `Payment would breach the wallet reserve: balance ${(balance - this.pendingCents).toFixed(2)}¢ - ${amount.toFixed(4)}¢ < reserve ${policy.minimumReserveCents}¢`,
+      };
     }
 
     const entry = this.spendEntry(payment);
@@ -131,15 +144,15 @@ export class SpendGuard implements X402SpendGuard {
     try {
       if (spendTracker.reserveSpend) {
         const reserved = spendTracker.reserveSpend(entry, policy);
-        if (!reserved.allowed) return `${category} spend cap reached: ${reserved.reason}`;
+        if (!reserved.allowed) return this.capRefusal(reserved, amount);
         reservationId = reserved.reservationId;
       } else {
         const limit = spendTracker.checkLimit(amount, category, policy);
-        if (!limit.allowed) return `${category} spend cap reached: ${limit.reason}`;
+        if (!limit.allowed) return this.capRefusal(limit, amount);
         spendTracker.recordSpend(entry);
       }
     } catch (err: any) {
-      return `Spend ledger unavailable, refusing to pay (${err?.message || String(err)})`;
+      return { reason: `Spend ledger unavailable, refusing to pay (${err?.message || String(err)})` };
     }
 
     const reservation: PendingSpend = { id: reservationId, amountCents: amount, at: this.now() };
@@ -176,6 +189,38 @@ export class SpendGuard implements X402SpendGuard {
       } catch (err) {
         logger.error("Failed to release spend reservation", err instanceof Error ? err : undefined);
       }
+    }
+  }
+
+  /** Refusal for a failed cap check, tagged with the cap that refused. */
+  private capRefusal(check: LimitCheckResult, amountCents: number): X402GuardRefusal {
+    const { category } = this.options;
+    const reason = `${category} spend cap reached: ${check.reason}`;
+    switch (check.limitType) {
+      case "hourly":
+        return {
+          reason,
+          limit: { limitType: "hourly", category, currentCents: check.currentHourlySpend, amountCents, limitCents: check.limitHourly },
+        };
+      case "daily":
+        return {
+          reason,
+          limit: { limitType: "daily", category, currentCents: check.currentDailySpend, amountCents, limitCents: check.limitDaily },
+        };
+      case "global_daily":
+        return {
+          reason,
+          limit: {
+            limitType: "global_daily",
+            category,
+            currentCents: check.currentTotalDailySpend ?? 0,
+            amountCents,
+            limitCents: check.limitTotalDaily ?? 0,
+          },
+        };
+      default:
+        // A tracker that does not tag its refusals: keep the plain error path.
+        return { reason };
     }
   }
 
