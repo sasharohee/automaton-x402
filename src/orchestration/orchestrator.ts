@@ -80,6 +80,8 @@ interface TickCounters {
   tasksAssigned: number;
   tasksCompleted: number;
   tasksFailed: number;
+  /** Stale tasks recovered from dead workers (re-assignments are not counted as assignments). */
+  tasksRecovered: number;
 }
 
 const DEFAULT_STATE: OrchestratorState = {
@@ -103,6 +105,11 @@ export class Orchestrator {
     config: any;
     /** Check if a worker agent is still alive. Used to recover stale tasks. */
     isWorkerAlive?: (address: string) => boolean;
+    /**
+     * Latest financial state computed by the agent loop (creditsCents is the
+     * spendable USDC in standalone mode). Used as the planner budget.
+     */
+    getFinancialState?: () => { creditsCents: number; usdcBalance: number } | undefined;
   }) {}
 
   async tick(): Promise<OrchestratorTickResult> {
@@ -110,6 +117,7 @@ export class Orchestrator {
       tasksAssigned: 0,
       tasksCompleted: 0,
       tasksFailed: 0,
+      tasksRecovered: 0,
     };
 
     let state = this.loadState();
@@ -187,6 +195,7 @@ export class Orchestrator {
       tasksAssigned: counters.tasksAssigned,
       tasksCompleted: counters.tasksCompleted,
       tasksFailed: counters.tasksFailed,
+      tasksRecovered: counters.tasksRecovered,
       goalsActive: getActiveGoals(this.params.db).length,
       agentsActive: this.getActiveAgentCount(),
     };
@@ -403,9 +412,7 @@ export class Orchestrator {
         await buildPlannerContext({
           db: this.params.db,
           workspace: new AgentWorkspace(goal.id),
-          funding: this.params.funding,
-          identityAddress: this.params.identity.address,
-          usdcBalance: Number(this.params.config?.usdcBalance ?? 0),
+          ...this.plannerBudget(),
           idleAgents: this.params.agentTracker.getIdle().length,
           busyAgents: Math.max(0, this.getActiveAgentCount() - this.params.agentTracker.getIdle().length),
           maxAgents: Number(this.params.config?.maxChildren ?? 3),
@@ -530,20 +537,37 @@ export class Orchestrator {
 
     // Recover stale tasks: workers that died (process restart, sandbox crash)
     // leave tasks stuck in 'assigned' forever. Detect and reset them.
+    const recoveredTaskIds = new Set<string>();
     if (this.params.isWorkerAlive) {
       const assignedTasks = getTasksByGoal(this.params.db, goal.id)
-        .filter((t) => t.status === "assigned" && t.assignedTo);
+        .filter((t) => (t.status === "assigned" || t.status === "running") && t.assignedTo);
       for (const task of assignedTasks) {
-        const alive = this.params.isWorkerAlive(task.assignedTo!);
-        if (!alive) {
-          logger.warn("Recovering stale task from dead worker", {
-            taskId: task.id,
-            worker: task.assignedTo,
-          });
-          this.params.db.prepare(
-            "UPDATE task_graph SET status = 'pending', assigned_to = NULL, started_at = NULL WHERE id = ?",
-          ).run(task.id);
+        const worker = task.assignedTo!;
+        // Self-assigned tasks are executed by the parent's own turns.
+        if (worker === this.params.identity?.address) {
+          continue;
         }
+        if (this.params.isWorkerAlive(worker)) {
+          continue;
+        }
+        logger.warn("Recovering stale task from dead worker", {
+          taskId: task.id,
+          worker,
+          retryCount: task.retryCount,
+          maxRetries: task.maxRetries,
+        });
+        // The worker is gone for good: never hand it another task.
+        this.markWorkerDead(worker);
+        // Counts as a failed attempt: back to pending while retries remain,
+        // otherwise the task fails (and the goal goes to replanning).
+        failTask(this.params.db, task.id, `Worker ${worker} died before finishing the task`, true);
+        const latest = getTaskById(this.params.db, task.id);
+        if (latest?.status === "failed") {
+          counters.tasksFailed += 1;
+        } else {
+          recoveredTaskIds.add(task.id);
+        }
+        counters.tasksRecovered += 1;
       }
     }
 
@@ -585,7 +609,10 @@ export class Orchestrator {
         }
 
         this.params.agentTracker.updateStatus(assignment.agentAddress, "running");
-        counters.tasksAssigned += 1;
+        // Re-assigning a recovered task is not new work for the sleep decision.
+        if (!recoveredTaskIds.has(task.id)) {
+          counters.tasksAssigned += 1;
+        }
       } catch (error) {
         const err = normalizeError(error);
 
@@ -704,9 +731,7 @@ export class Orchestrator {
         await buildPlannerContext({
           db: this.params.db,
           workspace: new AgentWorkspace(goal.id),
-          funding: this.params.funding,
-          identityAddress: this.params.identity.address,
-          usdcBalance: Number(this.params.config?.usdcBalance ?? 0),
+          ...this.plannerBudget(),
           idleAgents: this.params.agentTracker.getIdle().length,
           busyAgents: Math.max(0, this.getActiveAgentCount() - this.params.agentTracker.getIdle().length),
           maxAgents: Number(this.params.config?.maxChildren ?? 3),
@@ -848,10 +873,13 @@ export class Orchestrator {
   private findBusyAgentForReassign(): { address: string; name: string } | null {
     const idleAddresses = new Set(this.params.agentTracker.getIdle().map((agent) => agent.address));
 
+    // Local workers receive their single task at spawn time and cannot take
+    // a reassigned one, so they are never reassignment candidates.
     const rows = this.params.db.prepare(
       `SELECT name, address, status
        FROM children
        WHERE status IN ('running', 'healthy')
+         AND address NOT LIKE 'local://%'
        ORDER BY created_at ASC`,
     ).all() as { name: string; address: string; status: string }[];
 
@@ -993,6 +1021,35 @@ export class Orchestrator {
     ).get(goalId) as { id: string } | undefined;
 
     return row?.id ?? null;
+  }
+
+  private markWorkerDead(address: string): void {
+    this.params.db.prepare(
+      `UPDATE children
+       SET status = 'dead', last_checked = datetime('now')
+       WHERE (address = ? OR sandbox_id = ?)
+         AND status NOT IN ('dead', 'failed', 'cleaned_up')`,
+    ).run(address, address.replace("local://", ""));
+  }
+
+  /**
+   * Real budget for the planner, from the loop's financial state. Never
+   * derived from funding.getBalance(parent), which only tracks child funding.
+   * Undefined values fall back to the cached last_known_balance.
+   */
+  private plannerBudget(): { creditsCents?: number; usdcBalance?: number } {
+    const financial = this.params.getFinancialState?.();
+    if (!financial) {
+      return {};
+    }
+    return {
+      creditsCents: Number.isFinite(financial.creditsCents) && financial.creditsCents >= 0
+        ? financial.creditsCents
+        : undefined,
+      usdcBalance: Number.isFinite(financial.usdcBalance) && financial.usdcBalance >= 0
+        ? financial.usdcBalance
+        : undefined,
+    };
   }
 
   private getActiveAgentCount(): number {

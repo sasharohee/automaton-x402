@@ -487,13 +487,15 @@ describe("Agent Loop", () => {
       onTurnComplete: (turn) => turns.push(turn),
     });
 
-    // The intervention message should have been injected after the 3rd idle-only turn.
-    // Turn 4 should have the maintenance loop intervention as input.
-    const interventionTurn = turns.find(
-      (t) => t.input?.includes("MAINTENANCE LOOP DETECTED"),
-    );
-    expect(interventionTurn).toBeDefined();
-    expect(interventionTurn!.input).toContain("status-check tools");
+    // The agent is put to sleep right after the 3rd idle-only turn instead of
+    // being given one more (paid) turn with an injected message.
+    expect(turns.length).toBe(3);
+    expect(inference.calls.length).toBe(3);
+    expect(db.getAgentState()).toBe("sleeping");
+    expect(db.getKV("idle_backoff_level")).toBe("1");
+    // The reason rides along with the next wakeup prompt.
+    expect(db.getKV("loop.idle_sleep_note")).toContain("MAINTENANCE LOOP DETECTED");
+    expect(db.getKV("loop.idle_sleep_note")).toContain("status-check tools");
   });
 
   it("maintenance loop NOT triggered when turns mix idle and productive tools", async () => {
@@ -527,11 +529,9 @@ describe("Agent Loop", () => {
       onTurnComplete: (turn) => turns.push(turn),
     });
 
-    // No maintenance loop intervention should have been injected
-    const interventionTurn = turns.find(
-      (t) => t.input?.includes("MAINTENANCE LOOP DETECTED"),
-    );
-    expect(interventionTurn).toBeUndefined();
+    // No maintenance loop sleep: all 4 turns ran
+    expect(turns.length).toBe(4);
+    expect(db.getKV("loop.idle_sleep_note")).toBeUndefined();
   });
 
   it("maintenance loop triggers with varying idle tool combinations", async () => {
@@ -579,14 +579,13 @@ describe("Agent Loop", () => {
       onTurnComplete: (turn) => turns.push(turn),
     });
 
-    const interventionTurn = turns.find(
-      (t) => t.input?.includes("MAINTENANCE LOOP DETECTED"),
-    );
-    expect(interventionTurn).toBeDefined();
+    expect(turns.length).toBe(3);
+    expect(db.getAgentState()).toBe("sleeping");
+    expect(db.getKV("loop.idle_sleep_note")).toContain("MAINTENANCE LOOP DETECTED");
   });
 
-  it("loop enforcement forces sleep after warning is ignored (6 identical patterns)", async () => {
-    // 6 identical exec tool calls: warning fires at turn 3, enforcement at turn 6.
+  it("repetitive pattern forces sleep immediately (3 identical patterns)", async () => {
+    // 3 identical exec tool calls: the agent is put to sleep right away.
     // Use unique IDs to avoid DB collisions.
     function execResponse(uid: string): ReturnType<typeof toolCallResponse> {
       return {
@@ -614,10 +613,8 @@ describe("Agent Loop", () => {
     const inference = new MockInferenceClient([
       execResponse("e1"),
       execResponse("e2"),
-      execResponse("e3"), // Warning fires here
+      execResponse("e3"), // Detected here — forced sleep
       execResponse("e4"),
-      execResponse("e5"),
-      execResponse("e6"), // Enforcement fires here — forced sleep
     ]);
 
     const turns: AgentTurn[] = [];
@@ -633,19 +630,17 @@ describe("Agent Loop", () => {
       onStateChange: (state) => stateChanges.push(state),
     });
 
-    // Should have the warning at turn 4 (injected after turn 3)
-    const warningTurn = turns.find(
-      (t) => t.input?.includes("LOOP DETECTED"),
-    );
-    expect(warningTurn).toBeDefined();
+    expect(turns.length).toBe(3);
+    expect(db.getKV("loop.idle_sleep_note")).toContain("LOOP DETECTED");
+    expect(db.getKV("sleep_until")).toBeDefined();
 
-    // Agent should be sleeping due to enforcement
+    // Agent should be sleeping
     expect(db.getAgentState()).toBe("sleeping");
     expect(stateChanges[stateChanges.length - 1]).toBe("sleeping");
   });
 
-  it("loop enforcement resets when agent changes behavior after warning", async () => {
-    // 3 identical exec calls → warning → different tool → 3 more exec calls → warning (not enforcement)
+  it("repetitive pattern detection resets when agent changes behavior", async () => {
+    // 2 identical exec calls → different tool → 2 more exec calls: never 3 in a row
     function execResponse(uid: string): ReturnType<typeof toolCallResponse> {
       return {
         id: `resp_${uid}`,
@@ -672,14 +667,12 @@ describe("Agent Loop", () => {
     const inference = new MockInferenceClient([
       execResponse("r1"),
       execResponse("r2"),
-      execResponse("r3"), // Warning fires, loopWarningPattern = "exec"
-      // Turn 4: different tool — resets loopWarningPattern
+      // Turn 3: different tool — breaks the streak
       toolCallResponse([
         { name: "send_message", arguments: { to: "0x123", content: "hello" } },
       ]),
       execResponse("r5"),
       execResponse("r6"),
-      execResponse("r7"), // Warning fires again (NOT enforcement — tracker was reset)
       noToolResponse("Done."),
     ]);
 
@@ -694,18 +687,9 @@ describe("Agent Loop", () => {
       onTurnComplete: (turn) => turns.push(turn),
     });
 
-    // Should have gotten a warning, not enforcement (agent is still running, not force-slept)
-    // The second set of 3 identical patterns gets a NEW warning, not enforcement
-    const warningTurns = turns.filter(
-      (t) => t.input?.includes("LOOP DETECTED"),
-    );
-    expect(warningTurns.length).toBeGreaterThanOrEqual(2);
-
-    // No enforcement turn should exist
-    const enforcementTurn = turns.find(
-      (t) => t.input?.includes("LOOP ENFORCEMENT"),
-    );
-    expect(enforcementTurn).toBeUndefined();
+    // No repetitive-pattern sleep: all 6 turns ran
+    expect(turns.length).toBe(6);
+    expect(db.getKV("loop.idle_sleep_note")).toBeUndefined();
   });
 
   it("discover_agents turns are retained in context (not classified as idle)", { timeout: 180_000 }, async () => {
@@ -752,17 +736,13 @@ describe("Agent Loop", () => {
       onTurnComplete: (turn) => turns.push(turn),
     });
 
-    // No maintenance loop detection should fire since discover_agents is NOT idle
-    const maintenanceTurn = turns.find(
-      (t) => t.input?.includes("MAINTENANCE LOOP DETECTED"),
-    );
-    expect(maintenanceTurn).toBeUndefined();
-
-    // But the repetitive pattern detector SHOULD fire (3 identical patterns)
-    const loopWarning = turns.find(
-      (t) => t.input?.includes("LOOP DETECTED"),
-    );
-    expect(loopWarning).toBeDefined();
+    // No maintenance loop detection should fire since discover_agents is NOT idle,
+    // but the repetitive pattern detector SHOULD fire (3 identical patterns)
+    const note = db.getKV("loop.idle_sleep_note");
+    expect(note).toBeDefined();
+    expect(note).not.toContain("MAINTENANCE LOOP DETECTED");
+    expect(note).toContain("LOOP DETECTED");
+    expect(turns.length).toBe(3);
   });
 
   it("read_file turns are retained in context (not classified as idle)", async () => {
@@ -788,15 +768,10 @@ describe("Agent Loop", () => {
       onTurnComplete: (turn) => turns.push(turn),
     });
 
-    const maintenanceTurn = turns.find(
-      (t) => t.input?.includes("MAINTENANCE LOOP DETECTED"),
-    );
-    expect(maintenanceTurn).toBeUndefined();
-
-    const loopWarning = turns.find(
-      (t) => t.input?.includes("LOOP DETECTED"),
-    );
-    expect(loopWarning).toBeDefined();
+    const note = db.getKV("loop.idle_sleep_note");
+    expect(note).toBeDefined();
+    expect(note).not.toContain("MAINTENANCE LOOP DETECTED");
+    expect(note).toContain("LOOP DETECTED");
   });
 
   it("sleeps early when delegated work is active and no self-assigned parent task remains", async () => {

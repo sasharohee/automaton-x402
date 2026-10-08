@@ -63,6 +63,10 @@ export interface AutomatonConfig {
   agentId?: string;
   maxChildren: number;
   maxTurnsPerCycle?: number;
+  /** First idle sleep duration (seconds); doubles on each idle sleep. Default 300. */
+  idleSleepBaseSeconds?: number;
+  /** Cap for the idle sleep backoff (seconds). Default 3600. */
+  idleSleepMaxSeconds?: number;
   /** Child sandbox memory config (MB), default 1024 */
   childSandboxMemoryMb?: number;
   parentAddress?: string;

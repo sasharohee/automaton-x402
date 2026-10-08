@@ -16,6 +16,8 @@ export interface OrchestratorTickResult {
   tasksAssigned: number;
   tasksCompleted: number;
   tasksFailed: number;
+  /** Stale tasks recovered from dead workers this tick. */
+  tasksRecovered?: number;
   goalsActive: number;
   agentsActive: number;
 }

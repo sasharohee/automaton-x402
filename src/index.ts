@@ -29,6 +29,7 @@ import {
 } from "./heartbeat/config.js";
 import { consumeNextWakeEvent, insertWakeEvent } from "./state/database.js";
 import { runAgentLoop } from "./agent/loop.js";
+import { ensureStandaloneWorkDir } from "./agent/workdir.js";
 import { ModelRegistry } from "./inference/registry.js";
 import { loadSkills } from "./skills/loader.js";
 import { initStateRepo } from "./git/state-versioning.js";
@@ -222,6 +223,13 @@ async function run(): Promise<void> {
   }
   if (standalone) {
     logger.info(`[${new Date().toISOString()}] Provider: standalone (no Conway) — inference via BlockRun x402, host execution.`);
+    // Only writable directory for write_file and local workers.
+    try {
+      const workDir = ensureStandaloneWorkDir(config);
+      logger.info(`[${new Date().toISOString()}] Work directory: ${workDir}`);
+    } catch (err: any) {
+      logger.warn(`[${new Date().toISOString()}] Could not create work directory: ${err.message}`);
+    }
   }
 
   // Initialize database
