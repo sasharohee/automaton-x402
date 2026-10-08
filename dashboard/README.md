@@ -140,6 +140,24 @@ Réponse en `Cache-Control: no-store` ; 401 sans session valide.
 - `events` : du plus ancien au plus récent (≤ 200).
 - Tout champ peut manquer ou valoir `null` : l'interface le tolère.
 
+## Gains
+
+Le bloc « Gains », en haut de la page, lit le champ racine `earnings` de l'instantané
+(pusher v4). Le pusher relève chaque minute les **transferts USDC entrants sur Base**
+(lecture on-chain) vers le portefeuille de l'agent :
+
+- `totalUsd`, `todayUsd`, `count`, `countToday` ne comptent que les **revenus**
+  (paiements de clients), sur le même jour UTC que `spend.todayUsd` ;
+- les **apports du créateur** sont à part (`deposits`) et ne sont **pas** comptés comme gains ;
+- `netTodayUsd` = gains du jour − dépenses du jour (recalculé par la page s'il manque) ;
+- `last` / `recent` (10 max, du plus récent au plus ancien) : `{ "t", "amountUsd", "from" }` ;
+- `checkedAt`, `error`, `behindBlocks` alimentent le pied de carte (lecture impossible,
+  rattrapage en cours au-delà de 300 blocs de retard).
+
+Le bloc suit le même rafraîchissement que le reste (15 s), sans appel réseau
+supplémentaire. Un ancien pusher sans `earnings` affiche « Données de gains pas encore
+disponibles ».
+
 ## Sécurité
 
 - `/` et `/api/state` exigent une session valide (vérifiée dans `proxy.ts` avec Web Crypto,

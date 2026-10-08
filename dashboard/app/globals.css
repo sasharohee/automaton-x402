@@ -291,6 +291,99 @@ code {
   flex: 1;
 }
 
+/* Gains */
+
+.pos {
+  color: var(--ok);
+  font-variant-numeric: tabular-nums;
+}
+
+.neg {
+  color: var(--danger);
+  font-variant-numeric: tabular-nums;
+}
+
+.warn-text {
+  color: var(--warn);
+}
+
+.earnings {
+  border-color: rgba(63, 185, 80, 0.55);
+  border-left: 4px solid var(--ok);
+}
+
+.earnings.flash {
+  animation: earn-flash 2.5s ease-out;
+}
+
+@keyframes earn-flash {
+  0% {
+    background: rgba(63, 185, 80, 0.28);
+  }
+  100% {
+    background: var(--card);
+  }
+}
+
+.earn-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 0.25rem 0.6rem;
+  margin-bottom: 0.5rem;
+}
+
+.earn-head h2 {
+  margin: 0;
+}
+
+.earn-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 0.5rem 1.5rem;
+  align-items: start;
+}
+
+.earn-grid .big {
+  font-size: 2.2rem;
+  color: var(--ok);
+  margin: 0;
+}
+
+.earn-grid p {
+  margin: 0;
+}
+
+.earn-grid .note {
+  text-align: right;
+}
+
+.earn-empty {
+  margin: 0.75rem 0 0;
+  padding: 0.5rem 0.7rem;
+  border-radius: 6px;
+  background: rgba(139, 148, 158, 0.1);
+  color: var(--muted);
+  text-align: center;
+}
+
+.sub {
+  font-size: 0.8rem;
+  color: var(--muted);
+  font-weight: 600;
+  margin: 0.9rem 0 0.25rem;
+}
+
+.deposits,
+.earn-foot {
+  margin: 0.6rem 0 0;
+}
+
+.earn-foot {
+  border-top: 1px solid #21262d;
+  padding-top: 0.4rem;
+}
+
 /* Fil d'activité */
 
 .feed-head {
