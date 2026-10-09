@@ -12,6 +12,7 @@ import {
   dashboardPassword,
   verifySessionValue,
 } from "@/lib/session";
+import { checkService } from "@/lib/service";
 import { isFullSnapshot, readState, storeFull, storeHeartbeat } from "@/lib/store";
 
 export const runtime = "nodejs";
@@ -110,7 +111,8 @@ async function state(req: NextRequest): Promise<NextResponse> {
   if (!(await verifySessionValue(req.cookies.get(SESSION_COOKIE)?.value))) {
     return json({ error: "non authentifié" }, 401);
   }
-  return json(await readState());
+  const [current, service] = await Promise.all([readState(), checkService()]);
+  return json({ ...current, service });
 }
 
 async function login(req: NextRequest): Promise<NextResponse> {

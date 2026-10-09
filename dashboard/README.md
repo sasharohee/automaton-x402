@@ -36,6 +36,7 @@ npm run lint    # vérification TypeScript (tsc --noEmit)
 | `DASHBOARD_PASSWORD` | oui | Mot de passe de la page. Absent → la page affiche une erreur de configuration et rien n'est exposé. |
 | `KV_REST_API_URL` + `KV_REST_API_TOKEN` | non | Redis Upstash (API REST). Alias acceptés : `UPSTASH_REDIS_REST_URL` + `UPSTASH_REDIS_REST_TOKEN`. |
 | `BLOB_READ_WRITE_TOKEN` | non | Vercel Blob (store **privé**) pour un point de sauvegarde, utilisé seulement si Redis n'est pas configuré. |
+| `SERVICE_HEALTH_URL` | non | URL de santé du service public de l'agent, vérifiée par Vercel. Défaut : `http://81.15.150.181:8787/health`. |
 
 Générer des valeurs robustes, par exemple : `openssl rand -hex 32`.
 
@@ -95,10 +96,31 @@ gzip -c snapshot.json | curl -X POST https://<projet>.vercel.app/api/ingest \
 ### `GET /api/state` (session requise)
 
 ```json
-{ "snapshot": { … } | null, "receivedAt": "ISO|null", "serverNow": "ISO", "source": "memory|kv|blob|none" }
+{
+  "snapshot": { … } | null, "receivedAt": "ISO|null", "serverNow": "ISO", "source": "memory|kv|blob|none",
+  "service": { "ok": true, "httpStatus": 200, "latencyMs": 42, "checkedAt": "ISO", "target": "81.15.150.181:8787", "error": "…" }
+}
 ```
 
 Réponse en `Cache-Control: no-store` ; 401 sans session valide.
+
+## Deux statuts : service et cerveau
+
+L'en-tête affiche deux pastilles indépendantes :
+
+- **Service** : vérifié **par le serveur Vercel** à chaque `GET /api/state`, sans passer par
+  le pusher. Requête `GET` sur `SERVICE_HEALTH_URL` (délai 4 s, sans suivre les
+  redirections) ; « Service en ligne » si la réponse est en 2xx, sinon « Service hors
+  ligne » avec un libellé générique (« délai dépassé », « injoignable », « HTTP 503 »…).
+  Le résultat est mis en cache 30 s par instance et les vérifications simultanées sont
+  regroupées. Le corps de la réponse n'est jamais lu ni renvoyé, et seul `host:port` est
+  exposé (`target`).
+- **Cerveau** : fraîcheur du dernier envoi du pusher. « Cerveau à jour » si le dernier envoi
+  date de moins de 2 min, sinon « Cerveau en veille » (orange) : la machine du cerveau est
+  en pause et les chiffres affichés datent du dernier envoi, mais le service public peut
+  rester joignable.
+
+La carte « Statut » reprend l'état du service public et sa cible.
 
 ### `POST /api/login` / `POST /api/logout`
 

@@ -32,6 +32,7 @@ import type {
   EarningsInfo,
   Goal,
   Heartbeat,
+  ServiceStatus,
   SpendInfo,
   StateResponse,
   WalletInfo,
@@ -179,6 +180,7 @@ export default function Dashboard() {
 
   const receivedAt = parseTime(data?.receivedAt);
   const online = receivedAt !== null && serverNow - receivedAt < ONLINE_MS;
+  const service = isObject(data?.service) ? (data?.service ?? null) : null;
 
   if (!data) {
     return (
@@ -194,11 +196,27 @@ export default function Dashboard() {
         <div>
           <h1>{str(agent.name) ?? "Automaton"}</h1>
           <p className="muted small">
-            <span className={`pill ${online ? "ok" : "off"}`}>{online ? "En ligne" : "Hors ligne"}</span>{" "}
+            <ServicePill service={service} />{" "}
+            {service
+              ? service.ok
+                ? `vérifié par Vercel à ${fmtTime(parseTime(service.checkedAt), true)}${
+                    service.latencyMs !== null ? ` (${service.latencyMs} ms)` : ""
+                  }`
+                : (service.error ?? "injoignable")
+              : ""}
+          </p>
+          <p className="muted small">
+            <span className={`pill ${online ? "ok" : "warn"}`}>{online ? "Cerveau à jour" : "Cerveau en veille"}</span>{" "}
             {receivedAt !== null
               ? `Dernière mise à jour il y a ${fmtAgo(serverNow - receivedAt)}`
               : "Aucune donnée reçue"}
           </p>
+          {!online && (
+            <p className="muted small">
+              La machine du cerveau est en pause : les chiffres ci-dessous datent de la dernière mise à jour. Le
+              service public reste joignable.
+            </p>
+          )}
         </div>
         <button type="button" className="secondary" onClick={logout}>
           Se déconnecter
@@ -236,7 +254,7 @@ export default function Dashboard() {
           <EarningsCard earnings={earnings} spend={spend} serverNow={serverNow} />
 
           <div className="grid">
-            <StatusCard container={container} serverNow={serverNow} />
+            <StatusCard container={container} service={service} serverNow={serverNow} />
             <WalletCard wallet={wallet} serverNow={serverNow} />
             <SpendCard spend={spend} serverNow={serverNow} />
             <BrainCard agent={agent} serverNow={serverNow} />
@@ -457,7 +475,22 @@ function EarningsCard({
   );
 }
 
-function StatusCard({ container, serverNow }: { container: Partial<ContainerInfo>; serverNow: number }) {
+function ServicePill({ service }: { service: ServiceStatus | null }) {
+  if (!service) return <span className="pill warn">Service : inconnu</span>;
+  return (
+    <span className={`pill ${service.ok ? "ok" : "off"}`}>{service.ok ? "Service en ligne" : "Service hors ligne"}</span>
+  );
+}
+
+function StatusCard({
+  container,
+  service,
+  serverNow,
+}: {
+  container: Partial<ContainerInfo>;
+  service: ServiceStatus | null;
+  serverNow: number;
+}) {
   const state = str(container.state);
   const started = parseTime(container.startedAt);
   const finished = parseTime(container.finishedAt);
@@ -466,6 +499,17 @@ function StatusCard({ container, serverNow }: { container: Partial<ContainerInfo
   return (
     <section className="card">
       <h2>Statut</h2>
+      <Row label="Service public">
+        <span className={`badge ${service?.ok ? "goal-active" : "goal-failed"}`}>
+          {service ? (service.ok ? "en ligne" : "hors ligne") : "inconnu"}
+        </span>
+        {service && str(service.target) && (
+          <>
+            {" "}
+            <code>{str(service.target)}</code>
+          </>
+        )}
+      </Row>
       <Row label="Conteneur">
         <span className={`badge ${running ? "goal-active" : "goal-failed"}`}>
           {state ? (CONTAINER_STATES[state] ?? state) : "inconnu"}
