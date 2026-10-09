@@ -59,7 +59,7 @@ function createStandaloneSecretAccessRule(): PolicyRule {
     id: "secrets.standalone_secret_access",
     description: "Deny exec/read_file access to ~/.automaton, wallet.json and /proc secrets in standalone mode",
     priority: 200,
-    appliesTo: { by: "name", names: ["exec", "read_file"] },
+    appliesTo: { by: "name", names: ["exec", "read_file", "sandbox_upload"] },
     evaluate(request: PolicyRequest): PolicyRuleResult | null {
       if (!isStandalone(request.context?.config)) return null;
 
@@ -74,11 +74,12 @@ function createStandaloneSecretAccessRule(): PolicyRule {
         );
       }
 
-      const filePath = request.args.path;
+      // read_file: `path`; sandbox_upload: `local_path` (never copy secrets to a VM).
+      const filePath = request.tool.name === "sandbox_upload" ? request.args.local_path : request.args.path;
       if (typeof filePath !== "string" || !isSecretPath(filePath)) return null;
       return deny(
         "SECRET_ACCESS",
-        `read_file denied: ${filePath} is inside ~/.automaton or holds secrets. Your wallet key and agent state are off limits.`,
+        `${request.tool.name} denied: ${filePath} is inside ~/.automaton or holds secrets. Your wallet key and agent state are off limits.`,
       );
     },
   };

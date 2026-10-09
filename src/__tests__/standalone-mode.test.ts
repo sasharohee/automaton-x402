@@ -159,9 +159,11 @@ describe("tool availability in standalone mode", () => {
     }
   });
 
-  it("keeps every tool in Conway mode", () => {
+  it("keeps every tool in Conway mode, except the standalone Fluence tools", () => {
     const all = createBuiltinTools("sbx");
-    expect(filterToolsForProvider(all, createTestConfig())).toHaveLength(all.length);
+    const fluenceOnly = ["fluence_topup", "fluence_status", "sandbox_exec", "sandbox_upload"];
+    const kept = filterToolsForProvider(all, createTestConfig()).map((t) => t.name);
+    expect(kept).toEqual(all.map((t) => t.name).filter((n) => !fluenceOnly.includes(n)));
   });
 
   it("disabled-tool list only names real tools", () => {

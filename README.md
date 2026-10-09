@@ -137,7 +137,9 @@ At most `maxCallsPerHour` escalated calls per UTC clock hour; the count is store
 | `maxX402PaymentCents` | 10 ($0.10) | Any single x402 payment above this is refused **before signing** |
 | `maxSingleTransferCents` | 500 ($5) | Largest single transfer |
 | `minimumReserveCents` | 100 ($1) | Never spent: payments that would cross it are refused; it is also subtracted from the survival balance |
-| `x402AllowedDomains` | `blockrun.ai` | x402 payments to any other host are refused (Fluence will be added with phase 2) |
+| `x402AllowedDomains` | `blockrun.ai` | x402 payments to any other host are refused. Add `api.fluence.dev` to allow Fluence top-ups |
+| `maxComputeTopupCents` | unset (= compute disabled) | Largest single Fluence top-up. Applies only to the `compute` guard for `api.fluence.dev` |
+| `maxComputeMonthlyCents` | unset (= compute disabled) | Total Fluence top-ups per UTC calendar month; also the ceiling for a VM's 30-day cost |
 
 Other safeguards:
 
@@ -157,6 +159,39 @@ Other safeguards:
 - **`check_usdc_balance`** is cached for 5 minutes in standalone mode.
 - **Writable directory.** In standalone mode `write_file` and local workers can only write under `~/work` (created at startup). `~/.automaton`, the rest of `HOME` and the application directory are refused. Conway mode keeps `/root`.
 - **No inbound connectivity.** The system prompt tells the agent that servers it starts are only reachable from localhost, that it has no ETH for gas, and that it should earn only through outbound requests.
+
+### Fluence VM (optional)
+
+The agent can rent **one** small [Fluence CPU Cloud](https://fluence.dev/docs/build/api/cpu_cloud) VM that hosts **only its public x402 service**. The VM never receives the wallet, `wallet.json`, `~/.automaton`, a private key or an API key: the service only needs the `payTo` address. There is no replication and no agent runtime on the VM.
+
+```json
+{
+  "providerMode": "standalone",
+  "fluence": { "enabled": true },
+  "treasuryPolicy": {
+    "x402AllowedDomains": ["blockrun.ai", "api.fluence.dev"],
+    "maxComputeTopupCents": 1000,
+    "maxComputeMonthlyCents": 1000
+  }
+}
+```
+
+| `fluence` field | Default | Effect |
+|---|---|---|
+| `enabled` | `false` | Must be `true` (standalone mode only) |
+| `maxComputeVms` | 1 | Live VM limit; values above 1 are clamped to 1 |
+| `diskGb` | 25 | Boot disk size (10-50 GB) |
+| `sshUser` | the image's `username` (else `ubuntu`) | SSH user override |
+| `osImage` | Ubuntu 24.04, then 22.04, from `/v1/storages/default_images` | Boot image download URL (https) |
+| `apiUrl` | `https://api.fluence.dev` | Only `api.fluence.dev` can be paid |
+
+- **Login.** The runtime signs a SIWE message (`api.fluence.dev`, chain 8453) with the agent account. Session tokens stay in memory. One API key named `automaton` (scopes `vms:*`, `storage:*`, `public_ip:*`, `ssh_key:create/list/remove`, `clusters:read`, `prices:read`, 180-day expiry; reduced to the scopes in `/v1/users/me` if one is rejected) is created and stored in `~/.automaton/fluence.json` (mode 0600). It is sent as `X-API-KEY`. A key rejected with 401/403 is deleted server-side and recreated at most once per process start.
+- **Billing rules.** Fluence bills per second from the Fluence balance. A VM is accepted only if the balance covers all its resources for at least 6 hours. The VM, its public IP and its disk are billed separately. If the debt exceeds $5 or stays unpaid for 3 days, VMs and public IPs are terminated.
+- **Top-ups.** `fluence_topup` (risk level `dangerous`) pays `POST /v2/x402/top-up?amountUsd=N` in x402 v2. Minimum $10. Before anything is signed, the `compute` spend guard checks that the 402 challenge asks for exactly that amount in Base USDC on `eip155:8453`, that the amount is ≤ `maxComputeTopupCents`, that the month total stays ≤ `maxComputeMonthlyCents`, and that the reserve is kept. On a 409 nothing is re-signed. A retry after a 503 re-sends the same authorization. Compute spend is recorded in the ledger (category `compute`) but is not counted in the daily inference / global caps. Compute rows are never pruned before 35 days. Every other payment keeps `maxX402PaymentCents`.
+- **VM.** `create_sandbox` picks the cheapest `cpu-shared-*` configuration (`/v1/clusters/resources` + `/v1/prices/vm`) in a cluster with a free public IPv4 and non-replicated NVME storage, a 25 GB boot disk and the agent's SSH key (`/v1/ssh_keys`, reused on 409), then waits for `launched`. It is refused if a VM already exists or if the 30-day quote (`/v1/prices/cost`, VM + disk + IP) exceeds `maxComputeMonthlyCents`. `delete_sandbox` terminates the VM, waits for `terminated`, then deletes its public IP and its disk. Each step is tracked in the database and retried if it failed. Failed VMs are cleaned up the same way.
+- **SSH.** `sandbox_exec` and `sandbox_upload` use a dedicated ed25519 key in `~/.automaton/ssh/` (never shown to the model). The host key is pinned on first connect, then `StrictHostKeyChecking=yes`, `BatchMode=yes`, no agent or X11 forwarding. `ssh`/`scp` run through `execFile` (no local shell). `sandbox_upload` only accepts real paths under `~/work`. It refuses `~/.automaton`, `/proc`, `wallet*.json`, `*.key`, `*.pem`, `.env*`, symlinks leaving `~/work` (those inside `node_modules` are skipped) and any file that looks like a private key.
+- **Balance.** The `check_compute_balance` heartbeat task (every 30 min, no-op unless Fluence is enabled) reads the Fluence balance and the hourly burn. If the runway is under 3 days it wakes the agent with a `[COMPUTE]` message. Under 1 day, the message says whether a top-up fits the caps and the reserve; only the agent's own `fluence_topup` call can pay. The balance and runway are shown in the prompt status block. Fluence terminates VMs when the debt exceeds $5 or lasts 3 days.
+- **Unchanged.** `spawn_child`, `fund_child`, `start_child`, `transfer_credits`, `topup_credits`, the domain tools and `expose_port` / `remove_port` stay disabled. `fluence.json` and `ssh/` are never committed to the state repo, `exec` / `read_file` / `sandbox_upload` are denied on `~/.automaton`, and the Fluence modules are in `PROTECTED_FILES`.
 
 ### Public service (optional)
 

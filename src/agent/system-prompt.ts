@@ -27,6 +27,8 @@ import { sanitizeInput } from "./injection-defense.js";
 import { loadCurrentSoul } from "../soul/model.js";
 import { buildStandaloneModeNotice, buildPublicServiceStatus } from "./standalone-notice.js";
 import { getPublicService } from "./public-service.js";
+import { isFluenceEnabled } from "../fluence/config.js";
+import { FLUENCE_NOTICE, fluenceStatusLine } from "../fluence/status.js";
 
 function getCoreRules(chainType?: string): string {
   const usdcNetwork = chainType === "solana" ? "USDC on Solana" : "USDC on Base";
@@ -607,6 +609,7 @@ Your chain type is ${chainType}.`,
     if (publicService && publicServiceListening !== undefined) {
       sections.push(buildPublicServiceStatus(publicService, publicServiceListening));
     }
+    if (isFluenceEnabled(config)) sections.push(FLUENCE_NOTICE);
   }
 
   // Layer 3: SOUL.md -- structured soul model injection (Phase 2.1)
@@ -741,7 +744,7 @@ Recent self-modifications: ${recentMods.length}
 Inference model: ${config.inferenceModel}
 ERC-8004 Agent ID: ${registryEntry?.agentId || "not registered"}
 Children: ${children.filter((c) => c.status !== "dead").length} alive / ${children.length} total
-Lineage: ${lineageSummary}${upstreamLine}
+Lineage: ${lineageSummary}${upstreamLine}${fluenceStatusLine(config, db)}
 --- END STATUS ---`,
   );
 

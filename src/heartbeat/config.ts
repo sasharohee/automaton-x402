@@ -56,6 +56,13 @@ const DEFAULT_HEARTBEAT_CONFIG: HeartbeatConfig = {
       task: "check_social_inbox",
       enabled: true,
     },
+    {
+      // No-op unless standalone + fluence.enabled.
+      name: "check_compute_balance",
+      schedule: "*/30 * * * *",
+      task: "check_compute_balance",
+      enabled: true,
+    },
   ],
   defaultIntervalMs: 60_000,
   lowComputeMultiplier: 4,

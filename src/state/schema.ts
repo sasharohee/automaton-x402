@@ -5,7 +5,7 @@
  * The database IS the automaton's memory.
  */
 
-export const SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION = 12;
 
 export const CREATE_TABLES = `
   -- Schema version tracking
@@ -656,6 +656,30 @@ export const MIGRATION_V11 = `
   -- Schema version: 11
   -- Add chain_type column to children table for multi-chain support
   ALTER TABLE children ADD COLUMN chain_type TEXT DEFAULT 'evm';
+`;
+
+// === Fluence compute: 'compute' spend category ===
+// SQLite cannot alter a CHECK constraint: rebuild spend_tracking.
+
+export const MIGRATION_V12 = `
+  -- Schema version: 12
+  CREATE TABLE spend_tracking_v12 (
+    id TEXT PRIMARY KEY,
+    tool_name TEXT NOT NULL,
+    amount_cents INTEGER NOT NULL,
+    recipient TEXT,
+    domain TEXT,
+    category TEXT NOT NULL CHECK(category IN ('transfer','x402','inference','other','compute')),
+    window_hour TEXT NOT NULL,
+    window_day TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+  INSERT INTO spend_tracking_v12 (id, tool_name, amount_cents, recipient, domain, category, window_hour, window_day, created_at)
+    SELECT id, tool_name, amount_cents, recipient, domain, category, window_hour, window_day, created_at FROM spend_tracking;
+  DROP TABLE spend_tracking;
+  ALTER TABLE spend_tracking_v12 RENAME TO spend_tracking;
+  CREATE INDEX IF NOT EXISTS idx_spend_hour ON spend_tracking(category, window_hour);
+  CREATE INDEX IF NOT EXISTS idx_spend_day ON spend_tracking(category, window_day);
 `;
 
 export const MIGRATION_V10 = `

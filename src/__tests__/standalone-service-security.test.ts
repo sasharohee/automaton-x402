@@ -262,10 +262,10 @@ describe("secrets.standalone_secret_access policy rule", () => {
     };
   }
 
-  it("is registered in the default rules for exec and read_file", () => {
+  it("is registered in the default rules for exec, read_file and sandbox_upload", () => {
     const registered = createDefaultRules().find((r) => r.id === "secrets.standalone_secret_access");
     expect(registered).toBeDefined();
-    expect(registered!.appliesTo).toEqual({ by: "name", names: ["exec", "read_file"] });
+    expect(registered!.appliesTo).toEqual({ by: "name", names: ["exec", "read_file", "sandbox_upload"] });
   });
 
   it.each([

@@ -2,7 +2,8 @@
  * Spend Guard
  *
  * Enforces treasury limits on real USDC payments *before* they are signed:
- *   - per-payment maximum (maxX402PaymentCents)
+ *   - per-payment maximum (maxX402PaymentCents; for the `compute` category,
+ *     Fluence top-ups only, maxComputeTopupCents + a monthly cap instead)
  *   - hourly / daily caps per category (inference: maxInferenceDailyCents)
  *   - global daily cap, all categories combined (maxTotalDailySpendCents)
  *   - atomic check + record (reservation) so parallel callers cannot
@@ -22,8 +23,12 @@ import type {
 } from "../types.js";
 import type { X402GuardRefusal, X402PaymentInfo, X402SpendGuard } from "../conway/x402-v2.js";
 import { createLogger } from "../observability/logger.js";
+import { computeCaps } from "../agent/spend-tracker.js";
 
 const logger = createLogger("spend-guard");
+
+/** The only host a `compute` guard may pay (Fluence balance top-ups). */
+export const COMPUTE_PAYMENT_HOST = "api.fluence.dev";
 
 export interface SpendGuardOptions {
   policy: TreasuryPolicy;
@@ -107,7 +112,20 @@ export class SpendGuard implements X402SpendGuard {
       return { reason: `Invalid payment amount: ${amount}` };
     }
 
-    if (amount > policy.maxX402PaymentCents) {
+    if (category === "compute") {
+      // Compute top-ups: only to Fluence, with their own per-top-up cap.
+      // maxX402PaymentCents keeps applying to every other payment.
+      if (payment.host.toLowerCase() !== COMPUTE_PAYMENT_HOST) {
+        return { reason: `Compute payments are only allowed to ${COMPUTE_PAYMENT_HOST}, not ${payment.host}` };
+      }
+      const caps = computeCaps(policy);
+      if (!caps) {
+        return { reason: "Compute spending is disabled (maxComputeTopupCents / maxComputeMonthlyCents not set)" };
+      }
+      if (amount > caps.topupCents) {
+        return { reason: `Compute top-up of ${amount.toFixed(2)}¢ exceeds maxComputeTopupCents ${caps.topupCents}¢` };
+      }
+    } else if (amount > policy.maxX402PaymentCents) {
       return { reason: `Payment of ${amount.toFixed(4)}¢ exceeds per-request max of ${policy.maxX402PaymentCents}¢` };
     }
 

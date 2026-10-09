@@ -22,6 +22,8 @@ export const SENSITIVE_STATE_FILES = [
   "config.json",
   "automaton.json",
   "inference-providers.json",
+  "fluence.json",
+  "ssh/",
   ".env",
   ".env.*",
   "*.key",

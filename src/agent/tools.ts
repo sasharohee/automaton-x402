@@ -27,8 +27,22 @@ import { createLogger } from "../observability/logger.js";
 import { isStandalone, resolveBlockRunConfig } from "../conway/provider.js";
 import { ModelEscalation } from "../inference/model-escalation.js";
 import { resolveWriteRoots, type WriteRoots } from "./workdir.js";
+import { isFluenceEnabled } from "../fluence/config.js";
+import { getFluenceRuntime, type FluenceRuntime } from "../fluence/runtime.js";
+import { planUpload, isSafeRemotePath } from "../fluence/upload-guard.js";
+import {
+  FLUENCE_BILLING_NOTE,
+  FLUENCE_TERMINATION_NOTE,
+  formatFluenceStatus,
+  refreshFluenceStatus,
+} from "../fluence/status.js";
 
 const logger = createLogger("tools");
+
+/** Shared Fluence runtime (null unless standalone + fluence.enabled). */
+function fluenceRuntimeFor(ctx: ToolContext): FluenceRuntime | null {
+  return getFluenceRuntime({ config: ctx.config, account: ctx.identity.account, db: ctx.db.raw });
+}
 
 // ─── Path Confinement ─────────────────────────────────────────
 // write_file is restricted to a single directory tree:
@@ -381,7 +395,9 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
     {
       name: "create_sandbox",
       description:
-        "Create a new Conway sandbox (separate VM) for sub-tasks or testing.",
+        "Create a new sandbox (separate VM). Conway mode: a Conway sandbox. Standalone with Fluence: ONE small " +
+        "shared-CPU Fluence VM (cheapest plan, public IPv4) that may host only your public x402 service; refused if " +
+        "a VM already exists or its 30-day cost exceeds the monthly compute cap. " + FLUENCE_BILLING_NOTE,
       category: "conway",
       riskLevel: "caution",
       parameters: {
@@ -400,6 +416,16 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
         },
       },
       execute: async (args, ctx) => {
+        if (isFluenceEnabled(ctx.config)) {
+          // Fluence: always the cheapest shared plan; size arguments are ignored.
+          const info = await ctx.conway.createSandbox({ name: args.name as string });
+          return (
+            `Fluence VM created: ${info.id} [${info.status}]${info.terminalUrl ? ` (${info.terminalUrl})` : ""}. ` +
+            `It may take a few minutes to boot; check list_sandboxes for its public IP. ` +
+            `Use sandbox_upload / sandbox_exec to deploy ONLY your public x402 service (never wallet files or keys). ` +
+            FLUENCE_TERMINATION_NOTE
+          );
+        }
         const info = await ctx.conway.createSandbox({
           name: args.name as string,
           vcpu: args.vcpu as number,
@@ -411,7 +437,9 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
     },
     {
       name: "delete_sandbox",
-      description: "Delete a sandbox. Note: sandbox deletion is currently disabled by the Conway API.",
+      description:
+        "Delete a sandbox. Conway mode: currently disabled by the Conway API. Standalone with Fluence: terminates " +
+        "your Fluence VM and deletes its public IP and disk so nothing keeps billing.",
       category: "conway",
       riskLevel: "dangerous",
       parameters: {
@@ -424,8 +452,13 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
         },
         required: ["sandbox_id"],
       },
-      execute: async () => {
-        return "Sandbox deletion is disabled. Sandboxes are prepaid and non-refundable.";
+      execute: async (args, ctx) => {
+        if (!isFluenceEnabled(ctx.config)) {
+          return "Sandbox deletion is disabled. Sandboxes are prepaid and non-refundable.";
+        }
+        // Fluence: terminate the VM, then delete its public IP and disk.
+        await ctx.conway.deleteSandbox(args.sandbox_id as string);
+        return `Fluence VM ${args.sandbox_id} terminated; its public IP and disk were deleted (nothing left billing).`;
       },
     },
     {
@@ -440,9 +473,129 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
         return sandboxes
           .map(
             (s) =>
-              `${s.id} [${s.status}] ${s.vcpu}vCPU/${s.memoryMb}MB ${s.region}`,
+              `${s.id} [${s.status}] ${s.vcpu}vCPU/${s.memoryMb}MB ${s.region}${s.terminalUrl ? ` ${s.terminalUrl}` : ""}`,
           )
           .join("\n");
+      },
+    },
+
+    // ── Fluence compute (standalone + fluence.enabled only) ──
+    {
+      name: "fluence_status",
+      description:
+        "Free: your Fluence balance, live VMs, hourly burn and runway. " + FLUENCE_TERMINATION_NOTE + " " + FLUENCE_BILLING_NOTE,
+      category: "conway",
+      riskLevel: "safe",
+      parameters: { type: "object", properties: {} },
+      execute: async (_args, ctx) => {
+        const runtime = fluenceRuntimeFor(ctx);
+        if (!runtime) return "Fluence is not enabled.";
+        const snapshot = await refreshFluenceStatus(runtime, ctx.db);
+        const vms = runtime.vms.getLiveTrackedVms();
+        const vmLines = vms.map(
+          (v) =>
+            `- ${v.id} [${v.status}] ${v.configuration ?? "?"} ip=${v.public_ip ?? "pending"}` +
+            ` ~$${((v.monthly_cost_cents ?? 0) / 100).toFixed(2)}/30d` +
+            (v.vm_terminated ? " (terminated; IP/disk deletion pending: retry delete_sandbox)" : ""),
+        );
+        return [formatFluenceStatus(snapshot), ...vmLines, FLUENCE_TERMINATION_NOTE].join("\n");
+      },
+    },
+    {
+      name: "fluence_topup",
+      description:
+        "Pay USDC from your wallet (x402) to top up your Fluence balance. Minimum $10. Refused above " +
+        "treasuryPolicy.maxComputeTopupCents, above the monthly compute cap, or if it would cross your wallet reserve. " +
+        "Only top up when the VM's service earns more than it costs. " + FLUENCE_BILLING_NOTE,
+      category: "financial",
+      riskLevel: "dangerous",
+      parameters: {
+        type: "object",
+        properties: {
+          amount_usd: { type: "number", description: "Amount in USD (≥ 10, whole cents)" },
+        },
+        required: ["amount_usd"],
+      },
+      execute: async (args, ctx) => {
+        const runtime = fluenceRuntimeFor(ctx);
+        if (!runtime) return "Fluence is not enabled.";
+        const amountCents = Math.round((args.amount_usd as number) * 100);
+        if (Math.abs(amountCents - (args.amount_usd as number) * 100) > 1e-6) {
+          return "Top-up refused: amount_usd must be in whole cents.";
+        }
+        const result = await runtime.billing.topUp(amountCents);
+        if (result.ok) {
+          ctx.db.insertTransaction({
+            id: ulid(),
+            type: "credit_purchase",
+            amountCents,
+            description: `Fluence x402 top-up: $${(amountCents / 100).toFixed(2)}`,
+            timestamp: new Date().toISOString(),
+          });
+        }
+        return result.message;
+      },
+    },
+    {
+      name: "sandbox_exec",
+      description:
+        "Run a shell command on your Fluence VM over SSH (key and host key managed for you). " +
+        "The VM must only run your public x402 service: never copy wallet files, keys or API keys to it.",
+      category: "vm",
+      riskLevel: "caution",
+      parameters: {
+        type: "object",
+        properties: {
+          vm_id: { type: "string", description: "Fluence VM id (see list_sandboxes)" },
+          command: { type: "string", description: "Command to run on the VM" },
+          timeout: { type: "number", description: "Timeout in ms (default 60000, max 600000)" },
+        },
+        required: ["vm_id", "command"],
+      },
+      execute: async (args, ctx) => {
+        const runtime = fluenceRuntimeFor(ctx);
+        if (!runtime) return "Fluence is not enabled.";
+        const command = args.command as string;
+        const forbidden = isForbiddenCommand(command, ctx.identity.sandboxId);
+        if (forbidden) return forbidden;
+        const target = await runtime.vms.getSshTarget(args.vm_id as string);
+        const result = await runtime.ssh.exec(target, command, (args.timeout as number) || 60_000);
+        return `exit_code: ${result.exitCode}\nstdout: ${result.stdout}\nstderr: ${result.stderr}`;
+      },
+    },
+    {
+      name: "sandbox_upload",
+      description:
+        "Copy a file or directory from ~/work to your Fluence VM (scp). Only files under ~/work are allowed; " +
+        "wallet files, keys, .env files, ~/.automaton and anything that looks like a private key are refused.",
+      category: "vm",
+      riskLevel: "caution",
+      parameters: {
+        type: "object",
+        properties: {
+          vm_id: { type: "string", description: "Fluence VM id" },
+          local_path: { type: "string", description: "File or directory under ~/work" },
+          remote_path: { type: "string", description: "Destination path on the VM (e.g. ~/service)" },
+        },
+        required: ["vm_id", "local_path", "remote_path"],
+      },
+      execute: async (args, ctx) => {
+        const runtime = fluenceRuntimeFor(ctx);
+        if (!runtime) return "Fluence is not enabled.";
+        const roots = resolveWriteRoots(ctx.config);
+        const plan = planUpload(args.local_path as string, { home: roots.home, workRoot: roots.root });
+        if (!plan.ok) return plan.error;
+        if (!isSafeRemotePath(args.remote_path as string)) {
+          return "Refused: remote_path may only contain letters, digits and ._~/@+- (no spaces, no ..).";
+        }
+        if (plan.files.length === 0) return "Nothing to upload (no regular files).";
+        const target = await runtime.vms.getSshTarget(args.vm_id as string);
+        const result = await runtime.ssh.upload(target, plan.files, args.remote_path as string, plan.isDirectory);
+        if (result.exitCode !== 0) return `Upload failed: ${result.stderr}`;
+        return (
+          `Uploaded ${plan.files.length} file(s) to ${args.remote_path}.` +
+          (plan.skipped.length ? ` Skipped ${plan.skipped.length} symlink(s) pointing outside ~/work.` : "")
+        );
       },
     },
 
