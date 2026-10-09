@@ -80,9 +80,11 @@ function formatUtc(date: Date, timeOnly: boolean): string {
  * `[BUDGET] Hourly inference cap reached (83.87c of 84c). Sleeping until 19:00:05Z.`
  */
 export function formatBudgetSleepLog(refusal: SpendLimitRefusal, until: Date): string {
+  // The derived cap (daily / 6) keeps the original wording.
+  const hourlySource = refusal.hourlyCapExplicit === true ? " (maxInferenceHourlyCents)" : "";
   const label =
     refusal.limitType === "hourly"
-      ? `Hourly ${refusal.category} cap`
+      ? `Hourly ${refusal.category} cap${hourlySource}`
       : refusal.limitType === "daily"
         ? `Daily ${refusal.category} cap`
         : "Global daily spend cap";

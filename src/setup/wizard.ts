@@ -18,6 +18,7 @@ import {
   promptAddress,
   promptOptional,
   promptWithDefault,
+  promptOptionalPositive,
   closePrompts,
 } from "./prompts.js";
 import { detectEnvironment } from "./environment.js";
@@ -146,6 +147,12 @@ export async function runSetupWizard(): Promise<AutomatonConfig> {
     requireConfirmationAboveCents: await promptWithDefault(
       "Require confirmation above (cents)", DEFAULT_TREASURY_POLICY.requireConfirmationAboveCents),
   };
+
+  const maxInferenceHourlyCents = await promptOptionalPositive(
+    "Max hourly inference spend (cents, empty = daily / 6)");
+  if (maxInferenceHourlyCents !== undefined) {
+    treasuryPolicy.maxInferenceHourlyCents = maxInferenceHourlyCents;
+  }
 
   console.log(chalk.green("  Treasury policy configured.\n"));
 

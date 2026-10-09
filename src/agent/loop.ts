@@ -83,6 +83,7 @@ import {
   routeWithEscalation,
 } from "../inference/model-escalation.js";
 import { isCodingTurn } from "./coding-heuristic.js";
+import { businessReason, loadBusinessFocus, loadWakeEvents } from "./business-heuristic.js";
 import { scheduleIdleSleep, resetIdleBackoff } from "./idle-backoff.js";
 import { ensureStandaloneWorkDir } from "./workdir.js";
 import { buildStandaloneEarningGuidance } from "./standalone-notice.js";
@@ -250,6 +251,15 @@ export async function runAgentLoop(
   let lastToolPatterns: string[] = [];
   // Whether the previous turn was non-trivial coding (escalation signal).
   let previousTurnCoding = isCodingTurn(db.getRecentTurns(1)[0]?.toolCalls ?? []);
+  // The previous turn's input and tools, and when this wake started
+  // (business escalation signals).
+  const loopStartedAt = new Date();
+  const lastPersistedTurn = db.getRecentTurns(1)[0];
+  let previousBusinessTurn: { inputSource?: string; hadInbox: boolean; toolCalls: AgentTurn["toolCalls"] } = {
+    inputSource: lastPersistedTurn?.inputSource,
+    hadInbox: false,
+    toolCalls: lastPersistedTurn?.toolCalls ?? [],
+  };
   // Persisted across wakes so an agent that wakes up and only checks its
   // status goes straight back to sleep.
   let idleToolTurns = parseInt(db.getKV(IDLE_TOOL_TURNS_KEY) || "0", 10) || 0;
@@ -573,7 +583,18 @@ export async function runAgentLoop(
         modelEscalation && tierModel !== modelEscalation.model
           ? modelEscalation.begin(
               survivalTier,
-              escalationReason({ thinkHardReason, coding: previousTurnCoding }),
+              escalationReason({
+                thinkHardReason,
+                business: businessReason({
+                  claimedMessages: claimedMessages.length,
+                  inputSource: currentInput?.source,
+                  // The wake events only describe the first turn of a wake.
+                  wakeEvents: cycleTurnCount === 0 ? loadWakeEvents(db.raw, loopStartedAt) : [],
+                  previousTurn: previousBusinessTurn,
+                  focusTexts: loadBusinessFocus(db.raw),
+                }),
+                coding: previousTurnCoding,
+              }),
             )
           : null;
       const routedModel = escalationTicket?.model ?? tierModel ?? inference.getDefaultModel();
@@ -700,6 +721,11 @@ export async function runAgentLoop(
       });
       onTurnComplete?.(turn);
       previousTurnCoding = isCodingTurn(turn.toolCalls);
+      previousBusinessTurn = {
+        inputSource: currentInput?.source,
+        hadInbox: claimedMessages.length > 0,
+        toolCalls: turn.toolCalls,
+      };
 
       // Phase 2.2: Post-turn memory ingestion (non-blocking)
       try {

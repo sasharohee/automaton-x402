@@ -446,17 +446,17 @@ describe("routeWithEscalation fallback", () => {
     expect(esc.usage().used).toBe(1);
   });
 
-  it("a spend-cap refusal is rethrown, not retried on the tier model", async () => {
+  it("a spend-cap refusal on both models is rethrown after one tier-model retry", async () => {
     const ticket = esc.begin("high", "coding");
     const err = Object.assign(new Error("Hourly spend cap exceeded"), {
       code: "GUARD_REFUSED",
-      limit: { limitType: "hourly", currentCents: 83, requestedCents: 5, limitCents: 84 },
+      limit: { limitType: "hourly", category: "inference", currentCents: 83, amountCents: 5, limitCents: 84 },
     });
     const run = vi.fn(async () => {
       throw err;
     });
     await expect(routeWithEscalation({ escalation: esc, ticket, run })).rejects.toBe(err);
-    expect(run).toHaveBeenCalledTimes(1);
+    expect(run.mock.calls).toEqual([[PRO], [undefined]]);
     expect(esc.usage().used).toBe(0);
   });
 

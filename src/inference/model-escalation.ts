@@ -1,8 +1,9 @@
 /**
  * Difficulty-Based Model Escalation
  *
- * Routine work runs on the tier model. Hard work (planning, non-trivial
- * coding, explicit think_hard) is escalated to `blockrun.escalation.model`,
+ * Routine work runs on the tier model. Hard work (planning, business turns,
+ * non-trivial coding, explicit think_hard) is escalated to
+ * `blockrun.escalation.model`,
  * only in tiers high/normal and at most `maxCallsPerHour` calls per UTC
  * clock hour. The hourly count lives in the KV table so a restart does not
  * reset it. Escalated calls go through the same guarded x402 fetch and
@@ -79,16 +80,19 @@ function formatHour(date: Date): string {
 }
 
 /**
- * Why a call should be escalated, or null. An explicit think_hard wins,
- * then planning, then coding.
+ * Why a call should be escalated, or null. Precedence:
+ * think_hard > planning > business (business:inbox / :decision /
+ * :acquisition) > coding.
  */
 export function escalationReason(input: {
   thinkHardReason?: string;
   planning?: boolean;
+  business?: string | null;
   coding?: boolean;
 }): string | null {
   if (input.thinkHardReason) return `think_hard: ${input.thinkHardReason}`;
   if (input.planning) return "planning";
+  if (input.business) return input.business;
   if (input.coding) return "coding";
   return null;
 }
@@ -213,11 +217,29 @@ export class ModelEscalation {
   }
 }
 
+/** Log line for an escalated call that failed without being charged. */
+function fallbackMessage(what: string, model: string, err: unknown): string {
+  const refusal = getSpendLimitRefusal(err);
+  if (refusal) {
+    const round = (cents: number) => Math.round(cents * 100) / 100;
+    return (
+      `[MODEL] ${what} to ${model} refused by the ${refusal.limitType} ${refusal.category} cap ` +
+      `(${round(refusal.currentCents)}c + ${round(refusal.amountCents)}c > ${refusal.limitCents}c); ` +
+      `retrying once on the tier model.`
+    );
+  }
+  return (
+    `[MODEL] ${what} to ${model} failed (${err instanceof Error ? err.message : String(err)}); ` +
+    `falling back to the tier model.`
+  );
+}
+
 /**
  * Run an agent turn on the escalation model when `ticket` is set. A call
- * that fails without being charged gives its slot back and the turn runs on
- * the tier model. A charged call (even timed out) keeps its slot. Spend-cap
- * refusals are rethrown: the tier model would be refused too.
+ * that fails without being charged (including a spend guard refusal: per
+ * request max, hourly or daily cap) gives its slot back and the turn runs
+ * once on the tier model. If the tier model is refused too, that refusal is
+ * thrown (budget sleep). A charged call (even timed out) is never retried.
  */
 export async function routeWithEscalation(params: {
   escalation: ModelEscalation | undefined;
@@ -235,11 +257,7 @@ export async function routeWithEscalation(params: {
   } catch (err) {
     if (errorWasCharged(err)) throw err;
     escalation.release(ticket);
-    if (getSpendLimitRefusal(err)) throw err;
-    log(
-      `[MODEL] Escalated call to ${ticket.model} failed (${err instanceof Error ? err.message : String(err)}); ` +
-        `falling back to the tier model for this turn.`,
-    );
+    log(fallbackMessage("Escalated call", ticket.model, err));
     return run(undefined);
   }
 
@@ -287,11 +305,7 @@ export function createEscalatingPlannerInference(params: {
       } catch (err) {
         if (errorWasCharged(err)) throw err;
         escalation.release(ticket);
-        if (getSpendLimitRefusal(err)) throw err;
-        log(
-          `[MODEL] Escalated planner call to ${ticket.model} failed (${err instanceof Error ? err.message : String(err)}); ` +
-            `falling back to the tier model.`,
-        );
+        log(fallbackMessage("Escalated planner call", ticket.model, err));
         return inner.chat(request);
       }
     },

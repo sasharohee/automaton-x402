@@ -36,7 +36,7 @@ import { loadSkills } from "./skills/loader.js";
 import { initStateRepo } from "./git/state-versioning.js";
 import { createSocialClient } from "./social/client.js";
 import { PolicyEngine } from "./agent/policy-engine.js";
-import { SpendTracker } from "./agent/spend-tracker.js";
+import { SpendTracker, formatInferenceHourlyCap } from "./agent/spend-tracker.js";
 import { createDefaultRules } from "./agent/policy-rules/index.js";
 import type { AutomatonIdentity, AgentState, Skill, SocialClientInterface } from "./types.js";
 import { createLogger, setGlobalLogLevel, StructuredLogger } from "./observability/logger.js";
@@ -331,7 +331,7 @@ async function run(): Promise<void> {
     blockrunFetch = createBlockRunPaymentFetch({ config, account, spendTracker }).fetch;
     blockrunApiUrl = blockrun.apiUrl;
     logger.info(
-      `[${new Date().toISOString()}] BlockRun models: high=${blockrun.models.high || blockrun.models.normal} normal=${blockrun.models.normal} low=${blockrun.models.lowCompute} critical=${blockrun.models.critical} | caps: $${(treasuryPolicy.maxTotalDailySpendCents / 100).toFixed(2)}/day total, $${(treasuryPolicy.maxInferenceDailyCents / 100).toFixed(2)}/day inference, $${(treasuryPolicy.maxX402PaymentCents / 100).toFixed(2)}/request, reserve $${(treasuryPolicy.minimumReserveCents / 100).toFixed(2)}`,
+      `[${new Date().toISOString()}] BlockRun models: high=${blockrun.models.high || blockrun.models.normal} normal=${blockrun.models.normal} low=${blockrun.models.lowCompute} critical=${blockrun.models.critical} escalation=${blockrun.escalation?.model ?? "none"} (max ${blockrun.escalation?.maxCallsPerHour ?? 0}/h) | caps: $${(treasuryPolicy.maxTotalDailySpendCents / 100).toFixed(2)}/day total, $${(treasuryPolicy.maxInferenceDailyCents / 100).toFixed(2)}/day inference, ${formatInferenceHourlyCap(treasuryPolicy)}, $${(treasuryPolicy.maxX402PaymentCents / 100).toFixed(2)}/request, reserve $${(treasuryPolicy.minimumReserveCents / 100).toFixed(2)}`,
     );
   }
 

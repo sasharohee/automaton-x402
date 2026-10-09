@@ -200,7 +200,14 @@ export class SpendGuard implements X402SpendGuard {
       case "hourly":
         return {
           reason,
-          limit: { limitType: "hourly", category, currentCents: check.currentHourlySpend, amountCents, limitCents: check.limitHourly },
+          limit: {
+            limitType: "hourly",
+            category,
+            currentCents: check.currentHourlySpend,
+            amountCents,
+            limitCents: check.limitHourly,
+            ...(check.hourlyCapExplicit !== undefined ? { hourlyCapExplicit: check.hourlyCapExplicit } : {}),
+          },
         };
       case "daily":
         return {
