@@ -38,6 +38,7 @@ import {
 } from "../inference/model-escalation.js";
 import { SpendTracker, formatInferenceHourlyCap, inferenceHourlyCap } from "../agent/spend-tracker.js";
 import { formatBudgetSleepLog } from "../agent/budget-sleep.js";
+import { SpendGuard } from "../survival/spend-guard.js";
 import { X402PaymentError, attachX402Payment } from "../conway/x402-v2.js";
 import { insertGoal, insertTask, insertWakeEvent, consumeNextWakeEvent } from "../state/database.js";
 import { STANDALONE_TREASURY_POLICY, DEFAULT_TREASURY_POLICY } from "../types.js";
@@ -524,6 +525,29 @@ describe("treasuryPolicy.maxInferenceHourlyCents", () => {
       const check = tracker.checkLimit(6.4, "inference", policy({ maxInferenceHourlyCents: 50 }));
       expect(check.allowed).toBe(false);
       expect(check.limitHourly).toBe(50);
+    });
+
+    it("SpendGuard: the refusal carries the explicit cap; derived refusals are unchanged", async () => {
+      const guard = (p: TreasuryPolicy) =>
+        new SpendGuard({
+          policy: p,
+          category: "inference",
+          spendTracker: tracker,
+          getBalanceCents: async () => 10_000,
+          toolName: "blockrun_inference",
+        });
+      const derived = await guard(policy()).authorizeDetailed({ amountCents: 6.4, host: "blockrun.ai" });
+      expect(derived?.limit).toEqual({ limitType: "hourly", category: "inference", currentCents: 80, amountCents: 6.4, limitCents: 84 });
+      const explicit = await guard(policy({ maxInferenceHourlyCents: 50 })).authorizeDetailed({ amountCents: 6.4, host: "blockrun.ai" });
+      expect(explicit?.limit).toEqual({
+        limitType: "hourly",
+        category: "inference",
+        currentCents: 80,
+        amountCents: 6.4,
+        limitCents: 50,
+        hourlyCapExplicit: true,
+      });
+      expect(await guard(policy({ maxInferenceHourlyCents: 150 })).authorizeDetailed({ amountCents: 6.4, host: "blockrun.ai" })).toBeNull();
     });
 
     it("other categories are not affected", () => {

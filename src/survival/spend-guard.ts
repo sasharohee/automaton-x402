@@ -206,7 +206,8 @@ export class SpendGuard implements X402SpendGuard {
             currentCents: check.currentHourlySpend,
             amountCents,
             limitCents: check.limitHourly,
-            ...(check.hourlyCapExplicit !== undefined ? { hourlyCapExplicit: check.hourlyCapExplicit } : {}),
+            // Only tagged for an explicit cap: derived-cap refusals are unchanged.
+            ...(check.hourlyCapExplicit === true ? { hourlyCapExplicit: true } : {}),
           },
         };
       case "daily":
