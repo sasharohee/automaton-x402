@@ -167,6 +167,26 @@ If the operator publishes one local port of the container at a public HTTPS URL 
 - Each parent prompt reports whether `127.0.0.1:<servicePort>` answers. This is a local TCP connection with a 500 ms timeout and uses no inference.
 - The agent never sees the tunnel or its token. No guardrail changes: `x402AllowedDomains` stays `blockrun.ai`, because the facilitator is not paid in x402. `expose_port` stays disabled, writes stay confined to `~/work`, and all caps and the reserve are unchanged.
 
+### Service watchdog (optional)
+
+The built-in heartbeat task `service_watchdog` (standalone only, off by default) checks `http://127.0.0.1:<port><healthPath>` and runs a restart command after repeated failures:
+
+```json
+{
+  "serviceWatchdog": {
+    "restartCommand": "bash ~/work/summarizer/restart.sh",
+    "cwd": "~/work/summarizer",
+    "port": 8787, "healthPath": "/health",
+    "intervalSec": 120, "failuresBeforeRestart": 2, "maxRestartsPerHour": 3
+  }
+}
+```
+
+- Only `restartCommand` is required. `port` defaults to `publicService.servicePort`, `cwd` to `~/work`.
+- The agent can enable or change it itself with `modify_heartbeat` (`name: "service_watchdog"`, `params: {...}`). `modify_heartbeat` now rejects any task that is not a built-in (heartbeat never runs shell strings).
+- The restart command runs through the same local exec path as the `exec` tool (secret env variables removed, 20 s timeout). The command and `cwd` must stay inside `~/work`. Commands that reference `~/.automaton`, the wallet, `.env`, `..`, command substitution or variables other than `$HOME` are rejected.
+- Restarts are limited per rolling hour. Each check failure and restart is logged, and each restart leaves a wake event (source `watchdog`) so the agent learns about it.
+
 The legacy Conway mode is unchanged and remains available with `"providerMode": "conway"` (the default for existing configs).
 
 ## How It Works

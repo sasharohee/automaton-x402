@@ -430,16 +430,14 @@ describe("spend-cap refusal in the agent loop", () => {
       createdAt: new Date().toISOString(),
     });
     const inference = new ScriptedInference([
-      // Turn 1 (wakeup): real work, so the loop goes on to claim the inbox.
-      () => toolCallResponse([{ name: "exec", arguments: { command: "echo hi" } }]),
-      // Turn 2: the paid call is refused by the hourly cap.
+      // Turn 1 (wakeup, inbox claimed with it): the paid call is refused by the hourly cap.
       () => {
         throw capError(HOURLY_LIMIT);
       },
     ]);
     await run(inference);
 
-    expect(inference.calls).toBe(2); // refused once, never retried
+    expect(inference.calls).toBe(1); // refused once, never retried
     expect(db.getAgentState()).toBe("sleeping");
     expect(db.getKV("sleep_until")).toBe("2026-10-08T19:00:05.000Z");
     expect(db.getKV(BUDGET_SLEEP_UNTIL_KEY)).toBe("2026-10-08T19:00:05.000Z");
@@ -449,14 +447,14 @@ describe("spend-cap refusal in the agent loop", () => {
 
     // An early wake (heartbeat, inbox) does not run inference again.
     await run(inference);
-    expect(inference.calls).toBe(2);
+    expect(inference.calls).toBe(1);
     expect(db.getAgentState()).toBe("sleeping");
     expect(db.getKV("sleep_until")).toBe("2026-10-08T19:00:05.000Z");
 
     // Once the window has reset, the agent runs again.
     vi.setSystemTime(new Date("2026-10-08T19:00:06Z"));
     await run(inference);
-    expect(inference.calls).toBeGreaterThan(2);
+    expect(inference.calls).toBeGreaterThan(1);
     expect(db.getKV(BUDGET_SLEEP_UNTIL_KEY)).toBeUndefined();
   });
 
