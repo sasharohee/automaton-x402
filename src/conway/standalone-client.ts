@@ -19,6 +19,7 @@ import type {
   ExecResult,
   PortInfo,
   SandboxInfo,
+  CreateSandboxOptions,
   PricingTier,
   CreditTransferResult,
   DomainSearchResult,
@@ -49,6 +50,12 @@ export interface StandaloneClientOptions {
   readUsdcBalance?: (address: string) => Promise<number>;
   /** Override for tests. */
   fetchImpl?: typeof fetch;
+  /** Fluence VMs (fluence.enabled): backs create/list/delete_sandbox. */
+  sandboxes?: {
+    createSandbox(options: CreateSandboxOptions): Promise<SandboxInfo>;
+    listSandboxes(): Promise<SandboxInfo[]>;
+    deleteSandbox(id: string): Promise<{ done: boolean; remaining: string[] }>;
+  };
 }
 
 /**
@@ -86,9 +93,18 @@ export function createStandaloneClient(options: StandaloneClientOptions): Conway
 
     exposePort: unsupported("expose_port") as (port: number) => Promise<PortInfo>,
     removePort: unsupported("remove_port") as (port: number) => Promise<void>,
-    createSandbox: unsupported("create_sandbox") as () => Promise<SandboxInfo>,
-    deleteSandbox: unsupported("delete_sandbox") as (id: string) => Promise<void>,
-    listSandboxes: async () => [],
+    createSandbox: options.sandboxes
+      ? (opts: CreateSandboxOptions) => options.sandboxes!.createSandbox(opts)
+      : (unsupported("create_sandbox") as () => Promise<SandboxInfo>),
+    deleteSandbox: options.sandboxes
+      ? async (id: string) => {
+          const result = await options.sandboxes!.deleteSandbox(id);
+          if (!result.done) {
+            throw new Error(`Fluence VM ${id} only partly deleted; still billing: ${result.remaining.join(", ")}. Retry delete_sandbox.`);
+          }
+        }
+      : (unsupported("delete_sandbox") as (id: string) => Promise<void>),
+    listSandboxes: options.sandboxes ? () => options.sandboxes!.listSandboxes() : async () => [],
 
     getCreditsBalance: async () => {
       const usdc = await readBalance(options.walletAddress);

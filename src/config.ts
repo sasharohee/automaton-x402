@@ -29,6 +29,7 @@ import { createLogger } from "./observability/logger.js";
 import { resolveModelEscalation } from "./inference/model-escalation.js";
 import { isPositiveCap } from "./agent/spend-tracker.js";
 import type { ChainType } from "./identity/chain.js";
+import { parseFluenceConfig } from "./fluence/config.js";
 
 const logger = createLogger("config");
 const CONFIG_FILENAME = "automaton.json";
@@ -115,6 +116,14 @@ export function loadConfig(): AutomatonConfig | null {
         }
         continue;
       }
+      if (key === "maxComputeTopupCents" || key === "maxComputeMonthlyCents") {
+        // Optional: absent or 0 means compute spending is disabled.
+        if (value !== undefined && !(typeof value === "number" && Number.isFinite(value) && value >= 0)) {
+          logger.warn(`Invalid treasury value for ${key}: ${value}, compute spending disabled`);
+          delete (treasuryPolicy as any)[key];
+        }
+        continue;
+      }
       if (typeof value !== "number" || value < 0 || !Number.isFinite(value)) {
         logger.warn(`Invalid treasury value for ${key}: ${value}, using default`);
         (treasuryPolicy as any)[key] = (policyDefaults as any)[key];
@@ -175,6 +184,8 @@ export function loadConfig(): AutomatonConfig | null {
       autoUpdate: raw.autoUpdate === true,
       // Only meaningful (and only read) in standalone mode.
       publicService: standalone ? parsePublicServiceConfig(raw.publicService) : undefined,
+      // Fluence VMs: standalone only, opt-in.
+      fluence: standalone ? parseFluenceConfig(raw.fluence) : undefined,
     } as AutomatonConfig;
   } catch {
     return null;

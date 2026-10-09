@@ -6,7 +6,12 @@ balance. Phase 2 adds real servers again, on
 [Fluence CPU Cloud](https://fluence.dev/docs/build/api/cpu_cloud), paid with
 [x402](https://fluence.dev/docs/build/api/x402) from the agent's own wallet.
 
-Nothing in this document is implemented yet.
+Status: sections 1–4 are implemented in a reduced scope (one VM hosting only
+the public x402 service, `src/fluence/`, see the README "Fluence VM" section).
+Compute caps are `maxComputeTopupCents` and a UTC-month
+`maxComputeMonthlyCents` (not a daily cap), and `api.fluence.dev` must be
+added to `x402AllowedDomains` explicitly. Section 5 (replication) is not
+implemented.
 
 ## Constraints from Fluence
 

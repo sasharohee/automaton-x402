@@ -28,6 +28,9 @@ import { createX402Fetch, PaymentLedger } from "./x402-v2.js";
 import { getUsdcBalanceDetailed } from "./x402.js";
 import { SpendGuard } from "../survival/spend-guard.js";
 import { resolveModelEscalation } from "../inference/model-escalation.js";
+import type Database from "better-sqlite3";
+import { FLUENCE_SANDBOX_TOOLS, FLUENCE_TOOLS, isFluenceEnabled } from "../fluence/config.js";
+import { getFluenceRuntime } from "../fluence/runtime.js";
 
 export function isStandalone(config: Pick<AutomatonConfig, "providerMode"> | undefined | null): boolean {
   return config?.providerMode === "standalone";
@@ -97,25 +100,43 @@ export const STANDALONE_FORBIDDEN_TOOLS: ReadonlySet<string> = new Set([
   "review_upstream_changes",
 ]);
 
+/**
+ * Tools offered to the model for this provider. Fluence (standalone only,
+ * `fluence.enabled`) re-enables ONLY create/list/delete_sandbox and adds the
+ * fluence_* / sandbox_exec / sandbox_upload tools; they are hidden otherwise.
+ */
 export function filterToolsForProvider<T extends Pick<AutomatonTool, "name">>(
   tools: T[],
-  config: Pick<AutomatonConfig, "providerMode">,
+  config: Pick<AutomatonConfig, "providerMode" | "fluence">,
 ): T[] {
-  if (!isStandalone(config)) return tools;
-  return tools.filter((t) => !STANDALONE_DISABLED_TOOLS.has(t.name));
+  const fluence = isFluenceEnabled(config);
+  if (!isStandalone(config)) return tools.filter((t) => !FLUENCE_TOOLS.has(t.name));
+  return tools.filter((t) => {
+    if (FLUENCE_TOOLS.has(t.name)) return fluence;
+    if (fluence && FLUENCE_SANDBOX_TOOLS.has(t.name)) return true;
+    return !STANDALONE_DISABLED_TOOLS.has(t.name);
+  });
 }
 
 export function createProviderClient(params: {
   config: AutomatonConfig;
   apiKey: string;
   walletAddress: string;
+  /** Standalone + Fluence: the agent account (SIWE, x402 top-ups) and the DB. */
+  account?: PrivateKeyAccount;
+  db?: Database.Database;
 }): ConwayClient {
   const { config, apiKey, walletAddress } = params;
   if (isStandalone(config)) {
+    const fluence =
+      params.account && params.db
+        ? getFluenceRuntime({ config, account: params.account, db: params.db })
+        : null;
     return createStandaloneClient({
       walletAddress,
       reserveCents: resolveTreasuryPolicy(config).minimumReserveCents,
       blockrunApiUrl: resolveBlockRunConfig(config).apiUrl,
+      sandboxes: fluence?.vms,
     });
   }
   return createConwayClient({

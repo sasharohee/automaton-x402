@@ -716,6 +716,24 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
       return { shouldWake: false };
     }
   },
+
+  // Fluence balance / runway (no-op unless standalone + fluence.enabled). Never pays.
+  check_compute_balance: async (_ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
+    try {
+      const { getFluenceRuntime } = await import("../fluence/runtime.js");
+      const runtime = getFluenceRuntime({
+        config: taskCtx.config,
+        account: taskCtx.identity.account,
+        db: taskCtx.db.raw,
+      });
+      if (!runtime) return { shouldWake: false };
+      const { checkComputeBalance } = await import("../fluence/status.js");
+      return await checkComputeBalance(runtime, taskCtx.db);
+    } catch (error) {
+      logger.warn(`check_compute_balance failed: ${error instanceof Error ? error.message : String(error)}`);
+      return { shouldWake: false };
+    }
+  },
 };
 
 function tierToInt(tier: SurvivalTier): number {

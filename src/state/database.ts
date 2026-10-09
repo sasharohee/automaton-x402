@@ -46,6 +46,7 @@ import {
   MIGRATION_V9_ALTER_CHILDREN_ROLE,
   MIGRATION_V10,
   MIGRATION_V11,
+  MIGRATION_V12,
 } from "./schema.js";
 import type {
   RiskLevel,
@@ -625,6 +626,10 @@ function applyMigrations(db: DatabaseType): void {
         try { db.exec(MIGRATION_V11); } catch { /* column may already exist */ }
       },
     },
+    {
+      version: 12,
+      apply: () => db.exec(MIGRATION_V12),
+    },
   ];
 
   for (const m of migrations) {
@@ -842,10 +847,20 @@ export function getSpendByWindow(
   return row.total;
 }
 
+/**
+ * Delete spend records older than `olderThan`. `compute` rows also need to be
+ * older than 35 days, so the monthly compute cap always sees the whole month.
+ */
 export function pruneSpendRecords(db: DatabaseType, olderThan: string): number {
+  const computeCutoff = new Date(Date.now() - 35 * 86_400_000)
+    .toISOString()
+    .replace("T", " ")
+    .replace(/\.\d{3}Z$/, "");
   const result = db
-    .prepare("DELETE FROM spend_tracking WHERE created_at < ?")
-    .run(olderThan);
+    .prepare(
+      "DELETE FROM spend_tracking WHERE created_at < ? AND (category != 'compute' OR created_at < ?)",
+    )
+    .run(olderThan, computeCutoff);
   return result.changes;
 }
 

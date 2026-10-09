@@ -98,6 +98,25 @@ export interface AutomatonConfig {
    * this machine at a public HTTPS URL. Absent = no inbound connectivity.
    */
   publicService?: PublicServiceConfig;
+  /**
+   * Standalone only: rent ONE small Fluence CPU Cloud VM to host the public
+   * x402 service (no wallet, no agent runtime on the VM). Absent = disabled.
+   */
+  fluence?: FluenceConfig;
+}
+
+export interface FluenceConfig {
+  enabled: boolean;
+  /** API base URL (default https://api.fluence.dev). */
+  apiUrl?: string;
+  /** Hard limit on live Fluence VMs (default 1, never above 1). */
+  maxComputeVms?: number;
+  /** SSH user of the VM image (default "ubuntu"). */
+  sshUser?: string;
+  /** OS image for the boot disk (default: the first Ubuntu default image). */
+  osImage?: string;
+  /** Boot disk size in GB (default 25, max 50). */
+  diskGb?: number;
 }
 
 export interface PublicServiceConfig {
@@ -577,7 +596,8 @@ export type PolicyAction = 'allow' | 'deny' | 'quarantine';
 export type AuthorityLevel = 'system' | 'agent' | 'external';
 
 // Spend categories
-export type SpendCategory = 'transfer' | 'x402' | 'inference' | 'other';
+// 'compute': Fluence balance top-ups (own monthly budget, outside the daily caps)
+export type SpendCategory = 'transfer' | 'x402' | 'inference' | 'other' | 'compute';
 
 export type ToolSelector =
   | { by: 'name'; names: string[] }
@@ -712,6 +732,18 @@ export interface TreasuryPolicy {
    */
   maxTotalDailySpendCents: number;
   requireConfirmationAboveCents: number;
+  /**
+   * Compute (Fluence) top-ups: maximum for a single top-up. Absent or 0 =
+   * compute spending disabled. Applies only to the `compute` spend guard for
+   * api.fluence.dev; every other payment keeps maxX402PaymentCents.
+   */
+  maxComputeTopupCents?: number;
+  /**
+   * Compute (Fluence) top-ups: total allowed per UTC calendar month.
+   * Absent or 0 = compute spending disabled. Compute spend is not counted in
+   * the daily inference / global daily caps.
+   */
+  maxComputeMonthlyCents?: number;
 }
 
 export const DEFAULT_TREASURY_POLICY: TreasuryPolicy = {
@@ -739,7 +771,7 @@ export const STANDALONE_TREASURY_POLICY: TreasuryPolicy = {
   maxDailyTransferCents: 500,
   minimumReserveCents: 100, // $1 kept untouched in the wallet
   maxX402PaymentCents: 10, // $0.10 per request
-  // Fluence (phase 2) is not implemented yet: not allowed to be paid.
+  // Fluence top-ups need api.fluence.dev added explicitly in automaton.json.
   x402AllowedDomains: ["blockrun.ai"],
   transferCooldownMs: 0,
   maxTransfersPerTurn: 1,

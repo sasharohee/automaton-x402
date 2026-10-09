@@ -132,7 +132,7 @@ function createForbiddenPatternsRule(): PolicyRule {
     priority: 300,
     appliesTo: {
       by: "name",
-      names: ["exec"],
+      names: ["exec", "sandbox_exec"],
     },
     evaluate(request: PolicyRequest): PolicyRuleResult | null {
       const command = request.args.command as string | undefined;

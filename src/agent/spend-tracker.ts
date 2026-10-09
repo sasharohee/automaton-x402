@@ -50,6 +50,27 @@ export function formatInferenceHourlyCap(
 }
 
 /**
+ * Compute (Fluence) caps: both must be set (> 0), otherwise compute spending
+ * is disabled.
+ */
+export function computeCaps(
+  limits: Pick<TreasuryPolicy, "maxComputeTopupCents" | "maxComputeMonthlyCents">,
+): { topupCents: number; monthlyCents: number } | null {
+  if (!isPositiveCap(limits.maxComputeTopupCents) || !isPositiveCap(limits.maxComputeMonthlyCents)) {
+    return null;
+  }
+  return { topupCents: limits.maxComputeTopupCents, monthlyCents: limits.maxComputeMonthlyCents };
+}
+
+/** Current UTC calendar month: '2026-02'. */
+function getCurrentMonthWindow(): string {
+  return new Date().toISOString().slice(0, 7);
+}
+
+/** Compute rows are kept at least this long, so the monthly sum stays complete. */
+export const COMPUTE_SPEND_RETENTION_DAYS = 35;
+
+/**
  * Get the current hour window string in ISO format: '2026-02-19T14'
  */
 function getCurrentHourWindow(): string {
@@ -96,13 +117,26 @@ export class SpendTracker implements SpendTrackerInterface {
     return getSpendByWindow(this.db, category, "day", window);
   }
 
-  /** Spend recorded today (UTC) across every category. */
+  /**
+   * Spend recorded today (UTC) across every category except `compute`,
+   * which has its own monthly budget.
+   */
   getTotalDailySpend(): number {
     const row = this.db
       .prepare(
-        `SELECT COALESCE(SUM(amount_cents), 0) as total FROM spend_tracking WHERE window_day = ?`,
+        `SELECT COALESCE(SUM(amount_cents), 0) as total FROM spend_tracking WHERE window_day = ? AND category != 'compute'`,
       )
       .get(getCurrentDayWindow()) as { total: number };
+    return row.total;
+  }
+
+  /** Spend recorded in the current UTC calendar month for a category. */
+  getMonthlySpend(category: SpendCategory): number {
+    const row = this.db
+      .prepare(
+        `SELECT COALESCE(SUM(amount_cents), 0) as total FROM spend_tracking WHERE category = ? AND substr(window_day, 1, 7) = ?`,
+      )
+      .get(category, getCurrentMonthWindow()) as { total: number };
     return row.total;
   }
 
@@ -154,6 +188,8 @@ export class SpendTracker implements SpendTrackerInterface {
     category: SpendCategory,
     limits: TreasuryPolicy,
   ): LimitCheckResult {
+    if (category === "compute") return this.checkComputeLimit(amount, limits);
+
     const currentHourlySpend = this.getHourlySpend(category);
     const currentDailySpend = this.getDailySpend(category);
 
@@ -227,6 +263,44 @@ export class SpendTracker implements SpendTrackerInterface {
       limitHourly,
       limitDaily,
     };
+  }
+
+  /**
+   * Compute (Fluence) top-ups: per-top-up max and UTC calendar month total.
+   * Not part of the daily caps. Refusals carry no `limitType`: they are not
+   * windows the agent loop should sleep through.
+   */
+  private checkComputeLimit(amount: number, limits: TreasuryPolicy): LimitCheckResult {
+    const caps = computeCaps(limits);
+    const currentMonthlySpend = this.getMonthlySpend("compute");
+    const base = {
+      currentHourlySpend: currentMonthlySpend,
+      currentDailySpend: currentMonthlySpend,
+      limitHourly: caps?.monthlyCents ?? 0,
+      limitDaily: caps?.monthlyCents ?? 0,
+    };
+    if (!caps) {
+      return {
+        allowed: false,
+        reason: "Compute spending is disabled (set treasuryPolicy.maxComputeTopupCents and maxComputeMonthlyCents)",
+        ...base,
+      };
+    }
+    if (amount > caps.topupCents) {
+      return {
+        allowed: false,
+        reason: `Compute top-up of ${amount} exceeds maxComputeTopupCents ${caps.topupCents}`,
+        ...base,
+      };
+    }
+    if (currentMonthlySpend + amount > caps.monthlyCents) {
+      return {
+        allowed: false,
+        reason: `Monthly compute cap exceeded: current ${currentMonthlySpend} + ${amount} > ${caps.monthlyCents}`,
+        ...base,
+      };
+    }
+    return { allowed: true, ...base };
   }
 
   pruneOldRecords(retentionDays: number): number {

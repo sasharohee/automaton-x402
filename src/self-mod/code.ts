@@ -100,6 +100,24 @@ const PROTECTED_FILES: readonly string[] = Object.freeze([
   "setup/wizard.js",
   "setup/configure.ts",
   "setup/configure.js",
+  // Fluence compute: auth, compute caps / top-up, VM guards, SSH and upload guard
+  "fluence/auth.ts",
+  "fluence/auth.js",
+  "fluence/billing.ts",
+  "fluence/billing.js",
+  "fluence/client.ts",
+  "fluence/client.js",
+  "fluence/config.ts",
+  "fluence/config.js",
+  "fluence/runtime.ts",
+  "fluence/runtime.js",
+  "fluence/ssh.ts",
+  "fluence/ssh.js",
+  "fluence/status.ts",
+  "fluence/status.js",
+  "fluence/upload-guard.ts",
+  "fluence/upload-guard.js",
+  "fluence.json",
 ]);
 
 /**

@@ -274,6 +274,8 @@ async function run(): Promise<void> {
     config,
     apiKey: apiKey || "",
     walletAddress: chainIdentity.address,
+    account,
+    db: db.raw,
   });
 
   // Register automaton identity with Conway (one-time, immutable). Skipped in standalone mode.
