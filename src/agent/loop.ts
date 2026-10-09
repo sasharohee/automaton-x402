@@ -74,6 +74,13 @@ import { ProviderRegistry } from "../inference/provider-registry.js";
 import { UnifiedInferenceClient } from "../inference/inference-client.js";
 import { isIdleOnlyTool } from "./idle-only-tools.js";
 import { turnSignature } from "./loop-detector.js";
+import {
+  REPETITION_WINDOW_CALLS,
+  createRepetitionGuard,
+  formatRepetitionNote,
+  repetitionBlockedError,
+  type RepetitionHit,
+} from "./repetition-guard.js";
 import { isStandalone, filterToolsForProvider, resolveBlockRunConfig } from "../conway/provider.js";
 import { buildRoutingMatrix, registerMappedModels } from "../inference/model-map.js";
 import {
@@ -102,7 +109,7 @@ const IDLE_SLEEP_NOTE_KEY = "loop.idle_sleep_note";
  * Tools that count as real work. Used both for idle-turn detection and to
  * reset the idle sleep backoff.
  */
-const MUTATING_TOOLS = new Set([
+export const MUTATING_TOOLS: ReadonlySet<string> = new Set([
   "exec", "write_file", "edit_own_file", "transfer_credits", "topup_credits", "fund_child",
   "spawn_child", "start_child", "delete_sandbox", "create_sandbox",
   "install_npm_package", "install_mcp_server", "install_skill",
@@ -116,7 +123,11 @@ const MUTATING_TOOLS = new Set([
   "update_soul", "remember_fact", "set_goal", "complete_goal",
   "save_procedure", "note_about_agent", "forget",
   "enter_low_compute", "switch_model", "review_upstream_changes",
+  "sandbox_exec", "sandbox_upload", "fluence_topup", "fluence_status",
 ]);
+
+/** Brief sleep when the model repeats a blocked call right after the REPETITION note. */
+const REPETITION_SLEEP_MS = 60_000;
 
 
 /**
@@ -264,6 +275,11 @@ export async function runAgentLoop(
   // status goes straight back to sleep.
   let idleToolTurns = parseInt(db.getKV(IDLE_TOOL_TURNS_KEY) || "0", 10) || 0;
   // blockedGoalTurns removed — replaced by immediate sleep + exponential backoff
+  // Near-identical tool calls, seeded with the calls persisted in the last
+  // ~2 minutes so a brief sleep does not reset the count.
+  const repetitionGuard = createRepetitionGuard(db.getRecentTurns(REPETITION_WINDOW_CALLS));
+  // Cycle turn at which the last REPETITION note was injected.
+  let lastRepetitionNoteTurn: number | undefined;
 
   /** Put the agent to sleep with the persisted idle backoff (5/10/20/40/60 min). */
   const sleepWithBackoff = (reason: string): void => {
@@ -647,6 +663,7 @@ export async function runAgentLoop(
       };
 
       // ── Execute Tool Calls ──
+      let repetitionHit: RepetitionHit | null = null;
       if (response.toolCalls && response.toolCalls.length > 0) {
         const toolCallMessages: any[] = [];
         let callCount = 0;
@@ -679,6 +696,24 @@ export async function runAgentLoop(
           }
           const args = parsedArgs.args;
 
+          // Near-identical repetition: do not run the call, stop this turn's
+          // tool execution and tell the model on the next turn.
+          const hit = repetitionGuard.check(tc.function.name, args);
+          if (hit) {
+            const error = repetitionBlockedError(hit);
+            turn.toolCalls.push({
+              id: tc.id,
+              name: tc.function.name,
+              arguments: args,
+              result: "",
+              durationMs: 0,
+              error,
+            });
+            log(config, `[LOOP] ${tc.function.name} called with nearly the same arguments ${hit.count} times: not run.`);
+            repetitionHit = hit;
+            break;
+          }
+
           log(config, `[TOOL] ${tc.function.name}(${JSON.stringify(args).slice(0, 100)})`);
 
           const result = await executeTool(
@@ -697,6 +732,11 @@ export async function runAgentLoop(
           // Override the ID to match the inference call's ID
           result.id = tc.id;
           turn.toolCalls.push(result);
+          repetitionGuard.record(
+            tc.function.name,
+            args,
+            result.error ? `Error: ${result.error}` : result.result,
+          );
 
           log(
             config,
@@ -735,6 +775,24 @@ export async function runAgentLoop(
       } catch (error) {
         logger.error("Memory ingestion failed", error instanceof Error ? error : undefined);
         // Memory failure must not block the agent loop
+      }
+
+      // ── Near-identical repetition ──
+      // First time: the next prompt quotes the last result back. Repeated
+      // right after that note: brief sleep, the note rides along on wake.
+      if (repetitionHit) {
+        const note = formatRepetitionNote(repetitionHit);
+        if (lastRepetitionNoteTurn !== undefined && cycleTurnCount - lastRepetitionNoteTurn <= 1) {
+          log(config, `[LOOP] Repetition continued after the note. Sleeping ${REPETITION_SLEEP_MS / 1000}s.`);
+          db.setKV(IDLE_SLEEP_NOTE_KEY, `[system] ${note}`);
+          db.setKV("sleep_until", new Date(Date.now() + REPETITION_SLEEP_MS).toISOString());
+          db.setAgentState("sleeping");
+          onStateChange?.("sleeping");
+          running = false;
+          break;
+        }
+        pendingInput = { content: note, source: "system" };
+        lastRepetitionNoteTurn = cycleTurnCount;
       }
 
       // ── create_goal BLOCKED fast-break ──
