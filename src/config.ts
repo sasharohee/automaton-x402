@@ -166,6 +166,11 @@ export function loadConfig(): AutomatonConfig | null {
       autoUpdate: raw.autoUpdate === true,
       // Only meaningful (and only read) in standalone mode.
       publicService: standalone ? parsePublicServiceConfig(raw.publicService) : undefined,
+      // Standalone only; validated when the heartbeat schedules it.
+      serviceWatchdog:
+        standalone && raw.serviceWatchdog && typeof raw.serviceWatchdog === "object" && !Array.isArray(raw.serviceWatchdog)
+          ? raw.serviceWatchdog
+          : undefined,
     } as AutomatonConfig;
   } catch {
     return null;

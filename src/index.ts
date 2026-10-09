@@ -450,6 +450,9 @@ async function run(): Promise<void> {
   // The automaton alternates between running and sleeping.
   // The heartbeat can wake it up.
 
+  // The wake event that ended the last sleep, shown on the next first turn.
+  let wakeReason: { source: string; reason: string } | undefined;
+
   while (true) {
     try {
       // Reload skills (may have changed since last loop)
@@ -472,6 +475,7 @@ async function run(): Promise<void> {
         spendTracker,
         ollamaBaseUrl,
         blockrunFetch,
+        wakeReason,
         onStateChange: (state: AgentState) => {
           logger.info(`[${new Date().toISOString()}] State: ${state}`);
         },
@@ -481,6 +485,8 @@ async function run(): Promise<void> {
           );
         },
       });
+
+      wakeReason = undefined;
 
       // Agent loop exited (sleeping or dead)
       const state = db.getAgentState();
@@ -522,6 +528,7 @@ async function run(): Promise<void> {
               `[${new Date().toISOString()}] Woken by ${wakeEvent.source}: ${wakeEvent.reason}`,
             );
             db.deleteKV("sleep_until");
+            wakeReason = { source: wakeEvent.source, reason: wakeEvent.reason };
             break;
           }
         }

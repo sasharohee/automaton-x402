@@ -98,6 +98,12 @@ export interface AutomatonConfig {
    * this machine at a public HTTPS URL. Absent = no inbound connectivity.
    */
   publicService?: PublicServiceConfig;
+  /**
+   * Standalone only: built-in heartbeat task that health-checks the agent's
+   * local service and runs its restart command. Off unless configured here
+   * or enabled by the agent through modify_heartbeat.
+   */
+  serviceWatchdog?: ServiceWatchdogConfig;
 }
 
 export interface PublicServiceConfig {
@@ -105,6 +111,24 @@ export interface PublicServiceConfig {
   publicUrl: string;
   /** Local port published by the tunnel (default 8787, 1024-65535). */
   servicePort: number;
+}
+
+/** Raw `serviceWatchdog` block; validated by src/heartbeat/service-watchdog.ts. */
+export interface ServiceWatchdogConfig {
+  /** Local port to check (default: publicService.servicePort). */
+  port?: number;
+  /** Path of the health route (default "/health"). */
+  healthPath?: string;
+  /** Shell command that restarts the service, confined to ~/work. */
+  restartCommand?: string;
+  /** Directory the restart command runs in (default ~/work). */
+  cwd?: string;
+  /** Seconds between checks (default 120). */
+  intervalSec?: number;
+  /** Consecutive failed checks before a restart (default 2). */
+  failuresBeforeRestart?: number;
+  /** Restarts allowed per rolling hour (default 3). */
+  maxRestartsPerHour?: number;
 }
 
 export type ProviderMode = "conway" | "standalone";

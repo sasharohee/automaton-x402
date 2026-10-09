@@ -146,6 +146,39 @@ export function parseToolArguments(
   return { ok: true, args: parsed as Record<string, unknown> };
 }
 
+/** The wake event that ended the agent's last sleep (source + reason). */
+export interface WakeReason {
+  source: string;
+  reason: string;
+}
+
+/** Inbox messages as model input, each passed through the injection defence. */
+export function formatInboxMessages(messages: InboxMessageRow[]): string {
+  return messages
+    .map((m) => {
+      const from = sanitizeInput(m.fromAddress, m.fromAddress, "social_address");
+      const content = sanitizeInput(m.content, m.fromAddress, "social_message");
+      if (content.blocked) {
+        return `[INJECTION BLOCKED from ${from.content}]: message was blocked by safety filter`;
+      }
+      return `[Message from ${from.content}]: ${content.content}`;
+    })
+    .join("\n\n");
+}
+
+/** Wake reasons as model input. Reasons can quote external text: sanitized too. */
+export function formatWakeReasons(reasons: WakeReason[]): string {
+  return reasons
+    .map((wake) => {
+      const source = sanitizeInput(wake.source, "wake_event", "social_address").content;
+      const reason = sanitizeInput(wake.reason, `wake:${source}`, "social_message");
+      return reason.blocked
+        ? `[Wake reason from ${source} blocked by safety filter]`
+        : reason.content;
+    })
+    .join("\n");
+}
+
 export interface AgentLoopOptions {
   identity: AutomatonIdentity;
   config: AutomatonConfig;
@@ -161,6 +194,8 @@ export interface AgentLoopOptions {
   ollamaBaseUrl?: string;
   /** Standalone mode: guarded x402 fetch used for BlockRun inference. */
   blockrunFetch?: typeof fetch;
+  /** The wake event that ended the previous sleep, shown on the first turn. */
+  wakeReason?: WakeReason;
 }
 
 /**
@@ -278,8 +313,15 @@ export async function runAgentLoop(
 
   // Drain any stale wake events from before this loop started,
   // so they don't re-wake the agent after its first sleep.
-  let drained = 0;
-  while (consumeNextWakeEvent(db.raw)) drained++;
+  // Their reasons are still shown on the first turn, after the event that
+  // woke the agent.
+  const MAX_WAKE_REASONS = 5;
+  const wakeReasons: WakeReason[] = options.wakeReason ? [options.wakeReason] : [];
+  for (let event = consumeNextWakeEvent(db.raw); event; event = consumeNextWakeEvent(db.raw)) {
+    if (wakeReasons.length < MAX_WAKE_REASONS) {
+      wakeReasons.push({ source: event.source, reason: event.reason });
+    }
+  }
 
   // Clear any stale sleep_until from a previous session so the agent
   // doesn't immediately go back to sleep on startup.
@@ -309,6 +351,9 @@ export async function runAgentLoop(
     wakeupInput = `${wakeupInput}\n\n${idleSleepNote}`;
     db.deleteKV(IDLE_SLEEP_NOTE_KEY);
   }
+  if (wakeReasons.length > 0) {
+    wakeupInput = `${wakeupInput}\n\n--- WAKE REASON ---\n${formatWakeReasons(wakeReasons)}`;
+  }
 
   // Transition to running
   db.setAgentState("running");
@@ -328,6 +373,9 @@ export async function runAgentLoop(
     content: wakeupInput,
     source: "wakeup",
   };
+  // The first turn of a wake also gets the messages queued while asleep:
+  // otherwise an agent that sleeps again on turn 1 never reads them.
+  let firstTurnOfWake = true;
 
   while (running) {
     // Declared outside try so the catch block can access for retry/failure handling
@@ -347,24 +395,23 @@ export async function runAgentLoop(
 
       // Check for unprocessed inbox messages using the state machine:
       // received → in_progress (claim) → processed (on success) or received/failed (on failure)
-      if (!pendingInput) {
+      if (!pendingInput || firstTurnOfWake) {
         claimedMessages = claimInboxMessages(db.raw, 10);
         if (claimedMessages.length > 0) {
           // A real message arrived: the agent has something to do again.
           resetIdleBackoff(db);
-          const formatted = claimedMessages
-            .map((m) => {
-              const from = sanitizeInput(m.fromAddress, m.fromAddress, "social_address");
-              const content = sanitizeInput(m.content, m.fromAddress, "social_message");
-              if (content.blocked) {
-                return `[INJECTION BLOCKED from ${from.content}]: message was blocked by safety filter`;
+          const formatted = formatInboxMessages(claimedMessages);
+          pendingInput = pendingInput
+            ? {
+                content:
+                  `${pendingInput.content}\n\n--- UNREAD INBOX MESSAGES (${claimedMessages.length}) ---\n${formatted}\n\n` +
+                  `Read and handle these messages before you decide to sleep.`,
+                source: "agent",
               }
-              return `[Message from ${from.content}]: ${content.content}`;
-            })
-            .join("\n\n");
-          pendingInput = { content: formatted, source: "agent" };
+            : { content: formatted, source: "agent" };
         }
       }
+      firstTurnOfWake = false;
 
       // Refresh financial state periodically
       financial = await getFinancialState(conway, identity.address, db, config.chainType || identity.chainType || "evm");
@@ -496,7 +543,8 @@ export async function runAgentLoop(
           `SELECT 1 FROM task_graph WHERE assigned_to = ? AND status IN ('assigned', 'running') LIMIT 1`,
         ).get(identity.address);
         // A message from another agent or the creator always gets a turn.
-        const hasInboxInput = pendingInput?.source === "agent";
+        // Claimed messages must reach a turn (or go back via the catch block).
+        const hasInboxInput = pendingInput?.source === "agent" || claimedMessages.length > 0;
 
         if (
           orchestratorTick.tasksAssigned > 0 ||

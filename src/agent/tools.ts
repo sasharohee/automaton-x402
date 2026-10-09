@@ -719,7 +719,11 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
 
     {
       name: "modify_heartbeat",
-      description: "Add, update, or remove a heartbeat entry.",
+      description:
+        "Add, update, or remove a heartbeat entry. Heartbeat only runs BUILT-IN tasks (entry name = task name); " +
+        "shell commands are not supported. To keep your service up (standalone), use task \"service_watchdog\" " +
+        "with params {restartCommand (e.g. \"bash ~/work/<service>/restart.sh\"), cwd (inside ~/work), port, healthPath, " +
+        "intervalSec, failuresBeforeRestart, maxRestartsPerHour}.",
       category: "self_mod",
       riskLevel: "caution",
       parameters: {
@@ -729,22 +733,29 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
             type: "string",
             description: "add, update, or remove",
           },
-          name: { type: "string", description: "Entry name" },
+          name: { type: "string", description: "Entry name (must be the built-in task name)" },
           schedule: {
             type: "string",
-            description: "Cron expression (for add/update)",
+            description: "Cron expression (for add/update; service_watchdog uses params.intervalSec instead)",
           },
           task: {
             type: "string",
-            description: "Task name (for add/update)",
+            description: "Built-in task name (for add/update; defaults to name)",
           },
           enabled: { type: "boolean", description: "Enable/disable" },
+          params: {
+            type: "object",
+            description: "Task settings (service_watchdog only), merged over the saved ones",
+          },
         },
         required: ["action", "name"],
       },
       execute: async (args, ctx) => {
         const action = args.action as string;
         const name = args.name as string;
+        const { BUILTIN_TASKS } = await import("../heartbeat/tasks.js");
+        const watchdog = await import("../heartbeat/service-watchdog.js");
+        const existing = ctx.db.getHeartbeatEntries().find((e) => e.name === name);
 
         if (action === "remove") {
           ctx.db.upsertHeartbeatEntry({
@@ -752,16 +763,59 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
             schedule: "",
             task: "",
             enabled: false,
+            params: existing?.params,
           });
+          if (Object.hasOwn(BUILTIN_TASKS, name)) {
+            watchdog.applyHeartbeatSchedule(ctx.db.raw, name, { enabled: false });
+          }
           return `Heartbeat entry '${name}' disabled`;
         }
+        if (action !== "add" && action !== "update") {
+          throw new Error(`Unknown action "${action}": use add, update or remove.`);
+        }
 
-        ctx.db.upsertHeartbeatEntry({
-          name,
-          schedule: (args.schedule as string) || "0 * * * *",
-          task: (args.task as string) || name,
-          enabled: args.enabled !== false,
-        });
+        // The scheduler only runs built-in tasks, looked up by entry name.
+        const task = (args.task as string | undefined) || name;
+        if (!Object.hasOwn(BUILTIN_TASKS, task)) {
+          throw new Error(
+            `Unknown heartbeat task "${task}": nothing was saved. Heartbeat only runs built-in tasks ` +
+              `(${Object.keys(BUILTIN_TASKS).join(", ")}), never shell commands. ` +
+              `To restart a service, use task "service_watchdog" with params.restartCommand.`,
+          );
+        }
+        if (task !== name) {
+          throw new Error(`The entry name must be the built-in task name: use name "${task}".`);
+        }
+        if (args.params !== undefined && task !== watchdog.SERVICE_WATCHDOG_TASK) {
+          throw new Error(`params are only supported for "${watchdog.SERVICE_WATCHDOG_TASK}".`);
+        }
+        if (
+          args.params !== undefined &&
+          (typeof args.params !== "object" || args.params === null || Array.isArray(args.params))
+        ) {
+          throw new Error("params must be an object.");
+        }
+        const enabled = args.enabled !== false;
+
+        if (task === watchdog.SERVICE_WATCHDOG_TASK) {
+          const params = { ...(existing?.params ?? {}), ...((args.params as Record<string, unknown>) ?? {}) };
+          const settings = watchdog.resolveServiceWatchdogSettings(ctx.config, params);
+          if (!settings.ok) {
+            throw new Error(`Invalid service_watchdog settings: ${settings.error}. Nothing was saved.`);
+          }
+          ctx.db.upsertHeartbeatEntry({
+            name,
+            schedule: `every ${settings.value.intervalSec}s`,
+            task,
+            enabled,
+            params,
+          });
+          watchdog.scheduleServiceWatchdog(ctx.db.raw, settings.value, enabled);
+        } else {
+          const schedule = (args.schedule as string) || existing?.schedule || "0 * * * *";
+          ctx.db.upsertHeartbeatEntry({ name, schedule, task, enabled, params: existing?.params });
+          watchdog.applyHeartbeatSchedule(ctx.db.raw, name, { cronExpression: schedule, enabled });
+        }
 
         const { ulid } = await import("ulid");
         ctx.db.insertModification({

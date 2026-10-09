@@ -24,6 +24,7 @@ import type {
 import { BUILTIN_TASKS } from "./tasks.js";
 import { DurableScheduler } from "./scheduler.js";
 import { upsertHeartbeatSchedule } from "../state/database.js";
+import { initServiceWatchdog } from "./service-watchdog.js";
 import type BetterSqlite3 from "better-sqlite3";
 import { createLogger } from "../observability/logger.js";
 
@@ -97,6 +98,9 @@ export function createHeartbeatDaemon(
       leaseExpiresAt: null,
     });
   }
+
+  // Standalone: a configured service watchdog joins the schedule.
+  initServiceWatchdog(db, config);
 
   const scheduler = new DurableScheduler(
     rawDb,

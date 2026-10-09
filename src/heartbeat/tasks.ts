@@ -22,6 +22,7 @@ import { createLogger } from "../observability/logger.js";
 import { getMetrics } from "../observability/metrics.js";
 import { AlertEngine, createDefaultAlertRules } from "../observability/alerts.js";
 import { metricsInsertSnapshot, metricsPruneOld } from "../state/database.js";
+import { runServiceWatchdog } from "./service-watchdog.js";
 import { ulid } from "ulid";
 
 const logger = createLogger("heartbeat.tasks");
@@ -205,6 +206,9 @@ export const BUILTIN_TASKS: Record<string, HeartbeatTaskFn> = {
 
     return { shouldWake: false };
   },
+
+  // Standalone only; scheduled only when configured (see service-watchdog.ts).
+  service_watchdog: (_ctx: TickContext, taskCtx: HeartbeatLegacyContext) => runServiceWatchdog(taskCtx),
 
   check_social_inbox: async (_ctx: TickContext, taskCtx: HeartbeatLegacyContext) => {
     if (!taskCtx.social) return { shouldWake: false };
