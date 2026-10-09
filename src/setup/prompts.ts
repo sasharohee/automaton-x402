@@ -89,6 +89,21 @@ export async function promptAddress(label: string, chainType?: string): Promise<
  * Shows the label with default, validates input is a positive integer,
  * returns the default on empty or invalid input.
  */
+/**
+ * Prompt for an optional positive number. Returns undefined on empty or
+ * invalid input (the caller keeps its fallback).
+ */
+export async function promptOptionalPositive(label: string): Promise<number | undefined> {
+  const input = await ask(chalk.white(`  → ${label} [none]: `));
+  if (!input || input.trim() === "") return undefined;
+  const parsed = parseInt(input, 10);
+  if (isNaN(parsed) || parsed <= 0) {
+    console.log(chalk.yellow("  Invalid input, leaving it unset."));
+    return undefined;
+  }
+  return parsed;
+}
+
 export async function promptWithDefault(label: string, defaultValue: number): Promise<number> {
   const input = await ask(chalk.white(`  → ${label} [${defaultValue}]: `));
   if (!input || input.trim() === "") return defaultValue;

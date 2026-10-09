@@ -22,6 +22,33 @@ import {
 } from "../state/database.js";
 import type { SpendTrackingRow } from "../state/database.js";
 
+/** Whether an optional cap value is set: a positive finite number. */
+export function isPositiveCap(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0;
+}
+
+/**
+ * The hourly inference cap: `maxInferenceHourlyCents` when set, otherwise
+ * derived from the daily budget (daily / 6), so the whole daily budget
+ * cannot be consumed in one hour.
+ */
+export function inferenceHourlyCap(
+  limits: Pick<TreasuryPolicy, "maxInferenceDailyCents" | "maxInferenceHourlyCents">,
+): { cents: number; explicit: boolean } {
+  if (isPositiveCap(limits.maxInferenceHourlyCents)) {
+    return { cents: limits.maxInferenceHourlyCents, explicit: true };
+  }
+  return { cents: Math.ceil(limits.maxInferenceDailyCents / 6), explicit: false };
+}
+
+/** For the startup caps line, e.g. "$0.84/hour inference (derived: daily / 6)". */
+export function formatInferenceHourlyCap(
+  limits: Pick<TreasuryPolicy, "maxInferenceDailyCents" | "maxInferenceHourlyCents">,
+): string {
+  const cap = inferenceHourlyCap(limits);
+  return `$${(cap.cents / 100).toFixed(2)}/hour inference (${cap.explicit ? "maxInferenceHourlyCents" : "derived: daily / 6"})`;
+}
+
 /**
  * Get the current hour window string in ISO format: '2026-02-19T14'
  */
@@ -132,6 +159,7 @@ export class SpendTracker implements SpendTrackerInterface {
 
     let limitHourly: number;
     let limitDaily: number;
+    let hourlyCapExplicit: boolean | undefined;
 
     if (category === "transfer") {
       limitHourly = limits.maxHourlyTransferCents;
@@ -142,9 +170,9 @@ export class SpendTracker implements SpendTrackerInterface {
       limitHourly = limits.maxX402PaymentCents * 10;
       limitDaily = limits.maxX402PaymentCents * 50;
     } else {
-      // Derive a meaningful hourly cap from the daily budget.
-      // Without this, the entire daily budget could be consumed in one hour.
-      limitHourly = Math.ceil(limits.maxInferenceDailyCents / 6);
+      const hourlyCap = inferenceHourlyCap(limits);
+      limitHourly = hourlyCap.cents;
+      hourlyCapExplicit = hourlyCap.explicit;
       limitDaily = limits.maxInferenceDailyCents;
     }
 
@@ -157,6 +185,7 @@ export class SpendTracker implements SpendTrackerInterface {
         currentDailySpend,
         limitHourly,
         limitDaily,
+        ...(hourlyCapExplicit !== undefined ? { hourlyCapExplicit } : {}),
       };
     }
 

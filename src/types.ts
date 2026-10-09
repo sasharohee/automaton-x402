@@ -667,6 +667,8 @@ export interface LimitCheckResult {
   currentDailySpend: number;
   limitHourly: number;
   limitDaily: number;
+  /** Inference only: whether limitHourly is maxInferenceHourlyCents or derived (daily / 6). */
+  hourlyCapExplicit?: boolean;
   /** Set on a global_daily refusal. */
   currentTotalDailySpend?: number;
   limitTotalDaily?: number;
@@ -685,6 +687,8 @@ export interface SpendLimitRefusal {
   amountCents: number;
   /** The cap of the refusing window, in cents. */
   limitCents: number;
+  /** Hourly inference refusals: whether the cap is maxInferenceHourlyCents or derived. */
+  hourlyCapExplicit?: boolean;
 }
 
 export interface TreasuryPolicy {
@@ -697,6 +701,11 @@ export interface TreasuryPolicy {
   transferCooldownMs: number;
   maxTransfersPerTurn: number;
   maxInferenceDailyCents: number;
+  /**
+   * Optional explicit hourly inference cap. When absent, the hourly cap is
+   * derived as ceil(maxInferenceDailyCents / 6).
+   */
+  maxInferenceHourlyCents?: number;
   /**
    * Global cap on everything spent in a UTC day, all categories combined
    * (inference + x402 + transfers + other), on top of per-category caps.

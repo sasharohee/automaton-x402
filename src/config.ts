@@ -27,6 +27,7 @@ import { getAutomatonDir } from "./identity/wallet.js";
 import { loadApiKeyFromConfig } from "./identity/provision.js";
 import { createLogger } from "./observability/logger.js";
 import { resolveModelEscalation } from "./inference/model-escalation.js";
+import { isPositiveCap } from "./agent/spend-tracker.js";
 import type { ChainType } from "./identity/chain.js";
 
 const logger = createLogger("config");
@@ -106,6 +107,14 @@ export function loadConfig(): AutomatonConfig | null {
     // Validate all treasury values are positive numbers
     for (const [key, value] of Object.entries(treasuryPolicy)) {
       if (key === "x402AllowedDomains") continue; // array, not number
+      if (key === "maxInferenceHourlyCents") {
+        // Optional: absent means "derived from the daily cap".
+        if (value !== undefined && !isPositiveCap(value)) {
+          logger.warn(`Invalid treasury value for ${key}: ${value}, using the derived hourly cap`);
+          delete treasuryPolicy.maxInferenceHourlyCents;
+        }
+        continue;
+      }
       if (typeof value !== "number" || value < 0 || !Number.isFinite(value)) {
         logger.warn(`Invalid treasury value for ${key}: ${value}, using default`);
         (treasuryPolicy as any)[key] = (policyDefaults as any)[key];

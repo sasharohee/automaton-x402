@@ -109,9 +109,15 @@ Alternatively, keep every tier on `deepseek-chat` and let hard work escalate to 
 These are the defaults, so the block is optional. In tiers `high` and `normal` only, a call uses the escalation model when:
 - it is a planner call (orchestrator `planGoal` / `replanAfterFailure`);
 - the previous turn wrote a source file (`.ts`, `.js`, `.py`, `.sh`, `.json`, `.sql`, …, not notes or markdown), or ran a build/test/run command (`npm`, `node`, `tsc`, `python`, …) that exited non-zero;
-- the agent called `think_hard({ reason })` (next turn only).
+- the agent called `think_hard({ reason })` (next turn only);
+- it is a business turn (`src/agent/business-heuristic.ts`):
+  - `business:inbox`: the turn carries inbox / creator messages, the agent was woken by a new-message event, or the previous turn read messages (this turn replies);
+  - `business:decision`: the previous turn created, completed or cancelled a goal or task (`create_goal`, `cancel_goal`, `complete_goal`, `complete_task`, `set_goal`);
+  - `business:acquisition`: the previous turn used `update_agent_card`, `register_erc8004`, `discover_agents` or `send_message`, or the active goal / running task is about customers, listings, marketing, outreach, sales or pricing (FR + EN keywords: client, customer, prospect, annuaire, directory, listing, référencement, marketing, outreach, vente, sales, pricing, tarif, bazaar, x402scan, 8004), unless the previous turn was pure maintenance (status checks, sleep).
 
-At most `maxCallsPerHour` escalated calls per UTC clock hour; the count is stored in the database, so a restart does not reset it. Beyond that, the tier model is used until the next hour. Workers never escalate. Escalated calls go through the same x402 spend guard and caps as every other call. Set `maxCallsPerHour` to `0` to disable escalation.
+Precedence: `think_hard` > `planning` > `business:*` > `coding`. Routine turns (status checks, sleeping, log reading) stay on the tier model.
+
+At most `maxCallsPerHour` escalated calls per UTC clock hour; the count is stored in the database, so a restart does not reset it. Beyond that, the tier model is used until the next hour. Workers never escalate. Escalated calls go through the same x402 spend guard and caps as every other call. If the spend guard refuses an escalated call (per-request max, hourly or daily cap), the slot is given back and the turn is retried once on the tier model; if that is refused too, the usual `[BUDGET]` sleep applies. A call that was charged is never retried. Set `maxCallsPerHour` to `0` to disable escalation.
 
 ### Environment variables
 
@@ -126,7 +132,8 @@ At most `maxCallsPerHour` escalated calls per UTC clock hour; the count is store
 | Setting | Default | Effect |
 |---|---|---|
 | `maxTotalDailySpendCents` | 200 ($2/day) | **Global cap, all categories combined** (inference, `x402_fetch`, transfers…). Nothing is paid once reached |
-| `maxInferenceDailyCents` | 200 ($2/day) | Inference payments refused once reached (hourly envelope = daily / 6) |
+| `maxInferenceDailyCents` | 200 ($2/day) | Inference payments refused once reached (hourly envelope = daily / 6, unless `maxInferenceHourlyCents` is set) |
+| `maxInferenceHourlyCents` | unset | Optional explicit hourly inference cap. Unset (or not a positive number): the hourly cap stays `ceil(maxInferenceDailyCents / 6)` |
 | `maxX402PaymentCents` | 10 ($0.10) | Any single x402 payment above this is refused **before signing** |
 | `maxSingleTransferCents` | 500 ($5) | Largest single transfer |
 | `minimumReserveCents` | 100 ($1) | Never spent: payments that would cross it are refused; it is also subtracted from the survival balance |
