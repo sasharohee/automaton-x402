@@ -12,7 +12,10 @@ const logger = createLogger("fluence.config");
 
 export const FLUENCE_API_URL = "https://api.fluence.dev";
 export const FLUENCE_HOST = "api.fluence.dev";
+/** SSH user when neither the config nor the image gives one. */
 export const DEFAULT_FLUENCE_SSH_USER = "ubuntu";
+/** Valid Unix user name (also keeps `user@host` safe as an ssh argument). */
+export const SSH_USER_PATTERN = /^[a-z_][a-z0-9_-]{0,31}$/;
 export const DEFAULT_FLUENCE_DISK_GB = 25;
 export const MAX_FLUENCE_DISK_GB = 50;
 /** Hard limit: never more than one live Fluence VM. */
@@ -38,7 +41,9 @@ export const FLUENCE_SANDBOX_TOOLS: ReadonlySet<string> = new Set([
 export interface ResolvedFluenceConfig {
   apiUrl: string;
   maxComputeVms: number;
-  sshUser: string;
+  /** Override only; by default the SSH user comes from the chosen image (`username`). */
+  sshUser?: string;
+  /** Override only (boot disk `osImage` URL); by default an Ubuntu default image. */
   osImage?: string;
   diskGb: number;
 }
@@ -74,11 +79,17 @@ export function parseFluenceConfig(raw: unknown): FluenceConfig | undefined {
       logger.warn(`Invalid fluence.maxComputeVms: ${String(n)}, using ${MAX_COMPUTE_VMS}`);
     }
   }
-  if (typeof r.sshUser === "string" && /^[a-z_][a-z0-9_-]{0,31}$/.test(r.sshUser)) {
+  if (typeof r.sshUser === "string" && SSH_USER_PATTERN.test(r.sshUser)) {
     out.sshUser = r.sshUser;
   }
   if (typeof r.osImage === "string" && r.osImage.trim()) {
-    out.osImage = r.osImage.trim();
+    try {
+      const url = new URL(r.osImage.trim());
+      if (url.protocol !== "https:") throw new Error("not https");
+      out.osImage = url.toString();
+    } catch {
+      logger.warn(`Invalid fluence.osImage (must be an https download URL): ${r.osImage}, using a default Ubuntu image`);
+    }
   }
   if (r.diskGb !== undefined) {
     const n = r.diskGb;
@@ -102,7 +113,7 @@ export function resolveFluenceConfig(config: Pick<AutomatonConfig, "fluence">): 
   return {
     apiUrl: f?.apiUrl || FLUENCE_API_URL,
     maxComputeVms: Math.min(f?.maxComputeVms ?? MAX_COMPUTE_VMS, MAX_COMPUTE_VMS),
-    sshUser: f?.sshUser || DEFAULT_FLUENCE_SSH_USER,
+    sshUser: f?.sshUser || undefined,
     osImage: f?.osImage,
     diskGb: Math.min(f?.diskGb ?? DEFAULT_FLUENCE_DISK_GB, MAX_FLUENCE_DISK_GB),
   };

@@ -27,13 +27,19 @@ const CRITICAL_WAKE_COOLDOWN_MS = 2 * 3_600_000;
 export const FLUENCE_TERMINATION_NOTE =
   "Fluence terminates VMs when the account debt exceeds $5 or lasts 3 days.";
 
+/** Fluence billing rules, repeated in the tool descriptions. */
+export const FLUENCE_BILLING_NOTE =
+  "Fluence bills per second from your Fluence balance; a VM is accepted only if the balance covers all its " +
+  "resources for at least 6 hours; the VM, its public IP and its disk are billed separately; if the debt " +
+  "exceeds $5 or stays unpaid for 3 days, VMs and public IPs are terminated.";
+
 /** System-prompt section shown when Fluence is enabled. */
 export const FLUENCE_NOTICE = `--- FLUENCE COMPUTE ---
 You may rent ONE small Fluence VM (create_sandbox) to host ONLY your public x402 service. It has its own public IPv4.
 - The VM never gets your wallet, wallet.json, ~/.automaton, any private key or API key. Your service only needs your payTo address.
 - Deploy with sandbox_upload (files from ~/work only) and sandbox_exec. Same service security rules as locally.
 - It costs real money every hour from your Fluence balance (see the status block and fluence_status, which is free).
-- ${FLUENCE_TERMINATION_NOTE} Top up with fluence_topup (min $10, within the compute caps and your reserve) only if the service earns more than it costs; otherwise delete the VM (delete_sandbox removes VM, IP and disk).
+- ${FLUENCE_BILLING_NOTE} Top up with fluence_topup (min $10, within the compute caps and your reserve) only if the service earns more than it costs; otherwise delete the VM (delete_sandbox removes VM, IP and disk).
 --- END FLUENCE COMPUTE ---`;
 
 export interface FluenceStatusSnapshot {
@@ -57,13 +63,19 @@ export async function refreshFluenceStatus(
   db: Pick<AutomatonDatabase, "setKV">,
   now: () => number = Date.now,
 ): Promise<FluenceStatusSnapshot> {
-  const balanceCents = await runtime.vms.getBalanceCents();
+  const { cents: balanceCents, usageDaysLeft } = await runtime.vms.getBalance();
   const burnCentsPerHour = runtime.vms.getHourlyBurnCents();
+  const liveVms = runtime.vms.getLiveTrackedVms().filter((v) => v.vm_terminated === 0).length;
+  // Fluence's own `usageDaysLeft` is the runway when it gives one (and a VM is running).
+  const runwayHours =
+    usageDaysLeft !== null && liveVms > 0
+      ? Math.max(0, usageDaysLeft) * 24
+      : computeRunwayHours(balanceCents, burnCentsPerHour);
   const snapshot: FluenceStatusSnapshot = {
     balanceCents,
     burnCentsPerHour,
-    runwayHours: computeRunwayHours(balanceCents, burnCentsPerHour),
-    liveVms: runtime.vms.getLiveTrackedVms().filter((v) => v.vm_terminated === 0).length,
+    runwayHours,
+    liveVms,
     checkedAt: new Date(now()).toISOString(),
   };
   db.setKV(FLUENCE_STATUS_KV, JSON.stringify(snapshot));

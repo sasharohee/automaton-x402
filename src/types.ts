@@ -155,9 +155,9 @@ export interface FluenceConfig {
   apiUrl?: string;
   /** Hard limit on live Fluence VMs (default 1, never above 1). */
   maxComputeVms?: number;
-  /** SSH user of the VM image (default "ubuntu"). */
+  /** SSH user override (default: the image's `username`, else "ubuntu"). */
   sshUser?: string;
-  /** OS image for the boot disk (default: the first Ubuntu default image). */
+  /** Boot disk `osImage` download URL (default: Ubuntu 24.04, then 22.04, from the default images). */
   osImage?: string;
   /** Boot disk size in GB (default 25, max 50). */
   diskGb?: number;

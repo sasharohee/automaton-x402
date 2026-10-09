@@ -16,6 +16,7 @@ import { execFile } from "child_process";
 import { getAutomatonDir } from "../identity/wallet.js";
 import { scrubSecretEnv } from "../conway/local-exec.js";
 import { isSafeRemotePath, type UploadFile } from "./upload-guard.js";
+import { SSH_USER_PATTERN } from "./config.js";
 
 export const FLUENCE_SSH_KEY_NAME = "fluence_ed25519";
 const MAX_OUTPUT = 64 * 1024;
@@ -67,8 +68,9 @@ function safeId(id: string): string {
   return id.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 80);
 }
 
+/** Only a plain IPv4 address ever reaches ssh / scp / ssh-keyscan. */
 export function isValidHost(host: string): boolean {
-  return /^(\d{1,3}\.){3}\d{1,3}$/.test(host) || /^[0-9a-fA-F:]+$/.test(host) || /^[A-Za-z0-9.-]{1,253}$/.test(host);
+  return /^\d{1,3}(\.\d{1,3}){3}$/.test(host) && host.split(".").every((o) => Number(o) <= 255);
 }
 
 export class FluenceSsh {
@@ -152,6 +154,7 @@ export class FluenceSsh {
   /** Run a command on the VM (the remote shell interprets `command`). */
   async exec(target: SshTarget, command: string, timeoutMs = 60_000): Promise<SshRunResult> {
     if (!isValidHost(target.host)) throw new Error(`Invalid VM host: ${target.host}`);
+    if (!SSH_USER_PATTERN.test(target.user)) throw new Error(`Invalid VM user: ${target.user}`);
     await this.ensureKey();
     await this.ensureHostKey(target);
     const args = [...this.commonOptions(target.vmId), "-T", `${target.user}@${target.host}`, "--", command];
@@ -160,6 +163,8 @@ export class FluenceSsh {
 
   /** Copy already-validated files (see planUpload) to the VM. */
   async upload(target: SshTarget, files: UploadFile[], remotePath: string, isDirectory: boolean): Promise<SshRunResult> {
+    if (!isValidHost(target.host)) throw new Error(`Invalid VM host: ${target.host}`);
+    if (!SSH_USER_PATTERN.test(target.user)) throw new Error(`Invalid VM user: ${target.user}`);
     if (!isSafeRemotePath(remotePath)) throw new Error(`Invalid remote_path: ${remotePath}`);
     const dests = files.map((f) => (isDirectory ? path.posix.join(remotePath, f.relPath.split(path.sep).join("/")) : remotePath));
     for (const d of dests) {

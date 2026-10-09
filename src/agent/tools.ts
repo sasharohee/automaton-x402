@@ -30,7 +30,12 @@ import { resolveWriteRoots, type WriteRoots } from "./workdir.js";
 import { isFluenceEnabled } from "../fluence/config.js";
 import { getFluenceRuntime, type FluenceRuntime } from "../fluence/runtime.js";
 import { planUpload, isSafeRemotePath } from "../fluence/upload-guard.js";
-import { FLUENCE_TERMINATION_NOTE, formatFluenceStatus, refreshFluenceStatus } from "../fluence/status.js";
+import {
+  FLUENCE_BILLING_NOTE,
+  FLUENCE_TERMINATION_NOTE,
+  formatFluenceStatus,
+  refreshFluenceStatus,
+} from "../fluence/status.js";
 
 const logger = createLogger("tools");
 
@@ -392,7 +397,7 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
       description:
         "Create a new sandbox (separate VM). Conway mode: a Conway sandbox. Standalone with Fluence: ONE small " +
         "shared-CPU Fluence VM (cheapest plan, public IPv4) that may host only your public x402 service; refused if " +
-        "a VM already exists or its 30-day cost exceeds the monthly compute cap.",
+        "a VM already exists or its 30-day cost exceeds the monthly compute cap. " + FLUENCE_BILLING_NOTE,
       category: "conway",
       riskLevel: "caution",
       parameters: {
@@ -478,7 +483,7 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
     {
       name: "fluence_status",
       description:
-        "Free: your Fluence balance, live VMs, hourly burn and runway. " + FLUENCE_TERMINATION_NOTE,
+        "Free: your Fluence balance, live VMs, hourly burn and runway. " + FLUENCE_TERMINATION_NOTE + " " + FLUENCE_BILLING_NOTE,
       category: "conway",
       riskLevel: "safe",
       parameters: { type: "object", properties: {} },
@@ -501,7 +506,7 @@ export function createBuiltinTools(sandboxId: string): AutomatonTool[] {
       description:
         "Pay USDC from your wallet (x402) to top up your Fluence balance. Minimum $10. Refused above " +
         "treasuryPolicy.maxComputeTopupCents, above the monthly compute cap, or if it would cross your wallet reserve. " +
-        "Only top up when the VM's service earns more than it costs. " + FLUENCE_TERMINATION_NOTE,
+        "Only top up when the VM's service earns more than it costs. " + FLUENCE_BILLING_NOTE,
       category: "financial",
       riskLevel: "dangerous",
       parameters: {

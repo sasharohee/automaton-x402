@@ -20,11 +20,16 @@ import { FluenceBilling } from "../fluence/billing.js";
 import {
   FluenceVmClient,
   FluenceGuardError,
-  pickCheapestSharedConfiguration,
-  parseBalanceCents,
+  mapVm,
+  parseBalance,
   parseQuoteCents,
+  pickUbuntuImage,
+  sanitizeFluenceName,
+  sharedCandidates,
+  sshFingerprint,
+  vmHourlyPrice,
 } from "../fluence/client.js";
-import { FluenceSsh, type SshTransport } from "../fluence/ssh.js";
+import { FluenceSsh, isValidHost, type SshTransport } from "../fluence/ssh.js";
 import { planUpload, isSafeRemotePath, looksLikePrivateKey } from "../fluence/upload-guard.js";
 import {
   FLUENCE_TOOLS,
@@ -95,11 +100,16 @@ function spyAccount() {
 }
 
 function topupFetch(handler: (req: { url: string; init?: RequestInit; paid: boolean }) => Response) {
-  const calls: { url: string; paid: boolean }[] = [];
+  const calls: { url: string; paid: boolean; apiKey?: string; authorization?: string }[] = [];
   const fetchImpl = vi.fn(async (url: any, init?: RequestInit) => {
-    const headers = (init?.headers ?? {}) as Record<string, string>;
-    const paid = Object.keys(headers).some((k) => k.toUpperCase() === PAYMENT_SIGNATURE_HEADER);
-    calls.push({ url: String(url), paid });
+    const headers = new Headers(init?.headers as HeadersInit);
+    const paid = headers.has(PAYMENT_SIGNATURE_HEADER);
+    calls.push({
+      url: String(url),
+      paid,
+      apiKey: headers.get("X-API-KEY") ?? undefined,
+      authorization: headers.get("Authorization") ?? undefined,
+    });
     return handler({ url: String(url), init, paid });
   });
   return { fetchImpl: fetchImpl as unknown as typeof fetch, calls };
@@ -112,7 +122,7 @@ function billing(db: AutomatonDatabase, opts: { policy?: TreasuryPolicy; balance
     policy: opts.policy ?? POLICY,
     spendTracker: new SpendTracker(db.raw),
     getBalanceCents: async () => opts.balanceCents ?? 5000,
-    authHeaders: async () => ({ Authorization: "Bearer test-key" }),
+    authHeaders: async () => ({ "X-API-KEY": "test-key" }),
     fetchImpl: opts.fetchImpl,
   });
 }
@@ -256,6 +266,8 @@ describe("fluence top-up (x402 v2)", () => {
     expect(result.ok).toBe(true);
     expect(calls[0].url).toBe(`${FLUENCE}/v2/x402/top-up?amountUsd=10.00`);
     expect(calls.map((c) => c.paid)).toEqual([false, true]);
+    // The API key goes in X-API-KEY, never as a Bearer token.
+    expect(calls.every((c) => c.apiKey === "test-key" && c.authorization === undefined)).toBe(true);
     expect(computeRows(db)).toEqual([{ amount_cents: 1000, domain: "api.fluence.dev" }]);
   });
 
@@ -340,41 +352,72 @@ describe("fluence auth", () => {
   });
   afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
 
-  function authServer() {
-    const seen: { url: string; method: string; body?: any; auth?: string }[] = [];
-    let apiKeyRequests = 0;
+  type Seen = { url: string; method: string; body?: any; bearer?: string; apiKey?: string };
+
+  /**
+   * Mock Fluence with the documented shapes. `routes` may override any
+   * "METHOD /path" answer; `n` is the call count for that route.
+   */
+  function fluenceServer(routes: Record<string, (req: Seen, n: number) => Response> = {}) {
+    const seen: Seen[] = [];
+    const counts: Record<string, number> = {};
+    let keys = 0;
     const fetchImpl = vi.fn(async (url: any, init?: RequestInit) => {
       const u = String(url).replace(FLUENCE, "");
-      const headers = (init?.headers ?? {}) as Record<string, string>;
-      const body = init?.body ? JSON.parse(String(init.body)) : undefined;
-      seen.push({ url: u, method: init?.method || "GET", body, auth: headers.Authorization });
-      if (u === "/v1/auth/siwe/nonce") return json({ nonce: "abcdef12345678" });
-      if (u === "/v1/auth/siwe") return json({ accessToken: "ACCESS-SECRET-1", refreshToken: "REFRESH-SECRET-1" });
-      if (u === "/v1/api_keys") {
-        apiKeyRequests++;
-        return json({ id: "k1", key: "FLUENCE-API-KEY-SECRET" });
+      const headers = new Headers(init?.headers as HeadersInit);
+      const method = init?.method || "GET";
+      const req: Seen = {
+        url: u,
+        method,
+        body: init?.body ? JSON.parse(String(init.body)) : undefined,
+        bearer: headers.get("Authorization")?.replace(/^Bearer /, ""),
+        apiKey: headers.get("X-API-KEY") ?? undefined,
+      };
+      seen.push(req);
+      const route = `${method} ${u}`;
+      counts[route] = (counts[route] ?? 0) + 1;
+      if (routes[route]) return routes[route](req, counts[route]);
+      if (route === "GET /v1/auth/siwe/nonce") return json({ nonce: "abcdef12345678", expiresAt: "2030-01-01T00:00:00Z" });
+      if (route === "POST /v1/auth/siwe")
+        return json({ accessToken: "ACCESS-SECRET-1", refreshToken: "REFRESH-SECRET-1", userData: { id: "u1" } });
+      if (route === "POST /v1/api_keys") {
+        keys++;
+        return json({ id: `k${keys}`, name: "automaton", value: `FLUENCE-API-KEY-SECRET-${keys}` }, 201);
       }
-      if (u === "/v2/users/balances") return json({ balance: "12.34" });
+      if (route === "GET /v2/users/balances")
+        return json([
+          {
+            balance: "12.34",
+            usage: "0",
+            estimatedUsage: "0",
+            overage: "0",
+            totalDepositedAmount: "20",
+            usageDaysLeft: null,
+            userId: "u1",
+            featureKey: "vm",
+          },
+        ]);
       return json({}, 404);
     });
-    return { fetchImpl: fetchImpl as unknown as typeof fetch, seen, apiKeyRequests: () => apiKeyRequests };
+    return { fetchImpl: fetchImpl as unknown as typeof fetch, seen, keyCount: () => keys };
   }
 
-  it("logs in with SIWE (api.fluence.dev, chain 8453) and stores ONE API key with mode 0600", async () => {
-    const server = authServer();
+  const newAuth = (fetchImpl: typeof fetch, credentialsPath = path.join(dir, ".automaton", "fluence.json")) =>
+    new FluenceAuth({ account: TEST_ACCOUNT, apiUrl: FLUENCE, fetchImpl, credentialsPath });
+
+  it("logs in with SIWE (api.fluence.dev, chain 8453) and stores ONE API key (`value`) with mode 0600", async () => {
+    const server = fluenceServer();
     const credentialsPath = path.join(dir, ".automaton", "fluence.json");
     const out: string[] = [];
     const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation((chunk: any) => {
       out.push(String(chunk));
       return true;
     });
-    const auth = new FluenceAuth({ account: TEST_ACCOUNT, apiUrl: FLUENCE, fetchImpl: server.fetchImpl, credentialsPath });
     try {
-      const body = await auth.apiJson("/v2/users/balances");
-      expect(body).toEqual({ balance: "12.34" });
+      const body = await newAuth(server.fetchImpl, credentialsPath).apiJson("/v2/users/balances");
+      expect(body[0].balance).toBe("12.34");
       // A second instance (restart) reuses the stored key: no new SIWE login, no new key.
-      const auth2 = new FluenceAuth({ account: TEST_ACCOUNT, apiUrl: FLUENCE, fetchImpl: server.fetchImpl, credentialsPath });
-      await auth2.apiJson("/v2/users/balances");
+      await newAuth(server.fetchImpl, credentialsPath).apiJson("/v2/users/balances");
     } finally {
       writeSpy.mockRestore();
     }
@@ -383,21 +426,39 @@ describe("fluence auth", () => {
     expect(login.body.message).toContain(`${FLUENCE_SIWE_DOMAIN} wants you to sign in`);
     expect(login.body.message).toContain("URI: https://api.fluence.dev");
     expect(login.body.message).toContain("Chain ID: 8453");
+    expect(login.body.message).toContain("Nonce: abcdef12345678");
     expect(login.body.message).toContain(TEST_ACCOUNT.address);
-    expect(server.apiKeyRequests()).toBe(1);
+    expect(server.keyCount()).toBe(1);
     const keyReq = server.seen.find((s) => s.url === "/v1/api_keys")!;
-    expect(keyReq.auth).toBe("Bearer ACCESS-SECRET-1");
-    expect(keyReq.body.scopes).toEqual(expect.arrayContaining(["vms:read", "vms:write"]));
+    expect(keyReq.bearer).toBe("ACCESS-SECRET-1");
+    expect(keyReq.body.name).toMatch(/^[a-z0-9-]{1,25}$/);
+    expect(keyReq.body.scopes).toEqual([
+      "vms:read",
+      "vms:write",
+      "storage:read",
+      "storage:write",
+      "public_ip:read",
+      "public_ip:write",
+      "ssh_key:create",
+      "ssh_key:list",
+      "ssh_key:remove",
+      "clusters:read",
+      "prices:read",
+    ]);
     expect(new Date(keyReq.body.expiresAt).getTime() - Date.now()).toBeLessThanOrEqual(365 * 86_400_000);
-    expect(server.seen.filter((s) => s.url === "/v2/users/balances").every((s) => s.auth === "Bearer FLUENCE-API-KEY-SECRET")).toBe(true);
+    // API calls carry the key in X-API-KEY, never as a Bearer token.
+    const balanceCalls = server.seen.filter((s) => s.url === "/v2/users/balances");
+    expect(balanceCalls).toHaveLength(2);
+    expect(balanceCalls.every((s) => s.apiKey === "FLUENCE-API-KEY-SECRET-1" && s.bearer === undefined)).toBe(true);
 
     const stat = fs.statSync(credentialsPath);
     expect(stat.mode & 0o777).toBe(0o600);
-    const stored = fs.readFileSync(credentialsPath, "utf-8");
-    expect(stored).toContain("FLUENCE-API-KEY-SECRET");
+    const stored = JSON.parse(fs.readFileSync(credentialsPath, "utf-8"));
+    expect(stored.apiKey).toBe("FLUENCE-API-KEY-SECRET-1");
+    expect(stored.apiKeyId).toBe("k1");
     // Session tokens are memory-only.
-    expect(stored).not.toContain("ACCESS-SECRET-1");
-    expect(stored).not.toContain("REFRESH-SECRET-1");
+    expect(JSON.stringify(stored)).not.toContain("ACCESS-SECRET-1");
+    expect(JSON.stringify(stored)).not.toContain("REFRESH-SECRET-1");
     // Nothing secret reaches the logs.
     const logs = out.join("");
     for (const secret of ["ACCESS-SECRET-1", "REFRESH-SECRET-1", "FLUENCE-API-KEY-SECRET"]) {
@@ -405,27 +466,166 @@ describe("fluence auth", () => {
     }
   });
 
-  it("drops a rejected API key and creates a new one on 401", async () => {
-    let keys = 0;
-    let first = true;
-    const fetchImpl = (async (url: any, init?: RequestInit) => {
-      const u = String(url).replace(FLUENCE, "");
-      if (u === "/v1/auth/siwe/nonce") return json({ nonce: "abcdef12345678" });
-      if (u === "/v1/auth/siwe") return json({ accessToken: "a", refreshToken: "r" });
-      if (u === "/v1/api_keys") return json({ key: `key-${++keys}` });
-      const auth = ((init?.headers ?? {}) as Record<string, string>).Authorization;
-      if (first && auth === "Bearer key-1") {
-        first = false;
-        return json({}, 401);
-      }
-      return json({ ok: auth });
-    }) as unknown as typeof fetch;
-    const auth = new FluenceAuth({ account: TEST_ACCOUNT, apiUrl: FLUENCE, fetchImpl, credentialsPath: path.join(dir, "fluence.json") });
-    expect(await auth.apiJson("/v2/vms")).toEqual({ ok: "Bearer key-2" });
+  it("refuses an API key response without `value`", async () => {
+    const server = fluenceServer({ "POST /v1/api_keys": () => json({ id: "k1", key: "WRONG-FIELD" }) });
+    await expect(newAuth(server.fetchImpl).apiJson("/v2/vms")).rejects.toThrow(/API key missing/);
+  });
+
+  it("retries key creation once with the scopes listed in /v1/users/me → permissions", async () => {
+    const server = fluenceServer({
+      "POST /v1/api_keys": (_req, n) =>
+        n === 1 ? json({ message: "unknown scope prices:read" }, 400) : json({ id: "k9", value: "SCOPED-KEY" }),
+      "GET /v1/users/me": () => json({ id: "u1", permissions: ["vms:read", "vms:write", "clusters:read", "billing:admin"] }),
+      "GET /v2/vms": () => json({ items: [] }),
+    });
+    await newAuth(server.fetchImpl).apiJson("/v2/vms");
+    const keyReqs = server.seen.filter((s) => s.url === "/v1/api_keys");
+    expect(keyReqs).toHaveLength(2);
+    expect(keyReqs[1].body.scopes).toEqual(["vms:read", "vms:write", "clusters:read"]);
+    expect(server.seen.find((s) => s.url === "/v1/users/me")?.bearer).toBe("ACCESS-SECRET-1");
+    expect(server.seen.find((s) => s.url === "/v2/vms")?.apiKey).toBe("SCOPED-KEY");
+  });
+
+  it("on 401/403 deletes the rejected key server-side, then recreates it at most once per process", async () => {
+    const server = fluenceServer({
+      "GET /v2/vms": (req) => (req.apiKey === "FLUENCE-API-KEY-SECRET-2" ? json({ items: [] }) : json({}, 401)),
+      "DELETE /v1/api_keys/k1": () => new Response(null, { status: 204 }),
+      "GET /v1/clusters/resources": () => json({}, 403),
+    });
+    const auth = newAuth(server.fetchImpl);
+    expect(await auth.apiJson("/v2/vms")).toEqual({ items: [] });
+    const delIndex = server.seen.findIndex((s) => s.method === "DELETE");
+    const del = server.seen[delIndex];
+    expect(del.url).toBe("/v1/api_keys/k1");
+    expect(del.bearer).toBe("ACCESS-SECRET-1");
+    expect(del.apiKey).toBeUndefined();
+    // Deleted server-side BEFORE the new key is created.
+    expect(delIndex).toBeLessThan(server.seen.map((s) => s.url).lastIndexOf("/v1/api_keys"));
+    expect(server.keyCount()).toBe(2);
+    // The new key is rejected too: no second re-creation (no key-creation loop).
+    await expect(auth.apiJson("/v1/clusters/resources")).rejects.toThrow(/403/);
+    expect(server.keyCount()).toBe(2);
+    expect(server.seen.filter((s) => s.method === "DELETE")).toHaveLength(1);
+  });
+
+  it("refreshes the session with {refresh_token} and reads {access_token}", async () => {
+    const server = fluenceServer({
+      "POST /v1/api_keys": (req) => (req.bearer === "ACCESS-SECRET-2" ? json({ id: "k1", value: "KEY" }) : json({}, 401)),
+      "POST /auth/refresh": () => json({ access_token: "ACCESS-SECRET-2" }),
+      "GET /v2/vms": () => json({ items: [] }),
+    });
+    await newAuth(server.fetchImpl).apiJson("/v2/vms");
+    const refresh = server.seen.find((s) => s.url === "/auth/refresh")!;
+    expect(refresh.body).toEqual({ refresh_token: "REFRESH-SECRET-1" });
+    expect(server.seen.filter((s) => s.url === "/v1/auth/siwe")).toHaveLength(1);
+    expect(server.seen.filter((s) => s.url === "/v1/api_keys").map((s) => s.bearer)).toEqual([
+      "ACCESS-SECRET-1",
+      "ACCESS-SECRET-2",
+    ]);
+  });
+
+  it("reads the balance array with the API key and falls back to the Bearer session on 403", async () => {
+    const server = fluenceServer({
+      "GET /v2/users/balances": (req) =>
+        req.apiKey ? json({}, 403) : json([{ balance: "3.50", usageDaysLeft: 2 }, { balance: "1.00", usageDaysLeft: null }]),
+    });
+    const testDb = createTestDb();
+    const vms = new FluenceVmClient({
+      auth: newAuth(server.fetchImpl),
+      db: testDb.raw,
+      policy: POLICY,
+      config: resolveFluenceConfig({ fluence: { enabled: true } }),
+      ssh: { ensureKey: async () => "", forgetHost: () => undefined },
+    });
+    expect(await vms.getBalance()).toEqual({ cents: 450, usageDaysLeft: 2 });
+    const calls = server.seen.filter((s) => s.url === "/v2/users/balances");
+    expect(calls.map((c) => [c.apiKey, c.bearer])).toEqual([
+      ["FLUENCE-API-KEY-SECRET-1", undefined],
+      [undefined, "ACCESS-SECRET-1"],
+    ]);
+    // A 403 on the balance is a missing scope, not a bad key: no re-creation.
+    expect(server.keyCount()).toBe(1);
+    expect(server.seen.some((s) => s.method === "DELETE")).toBe(false);
+    testDb.close();
+  });
+
+  it("top-up headers carry the key as X-API-KEY, or nothing when no key can be obtained", async () => {
+    const ok = fluenceServer();
+    expect(await newAuth(ok.fetchImpl).authHeaders()).toEqual({ "X-API-KEY": "FLUENCE-API-KEY-SECRET-1" });
+    const down = fluenceServer({ "GET /v1/auth/siwe/nonce": () => json({}, 503) });
+    expect(await newAuth(down.fetchImpl, path.join(dir, "other.json")).authHeaders()).toEqual({});
   });
 });
 
 // ─── VM client ─────────────────────────────────────────────────
+
+const PUB_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHRlc3R0ZXN0dGVzdHRlc3R0ZXN0dGVzdHRlc3R0ZXN0 automaton-fluence";
+
+/** GET /v1/clusters/resources: two usable clusters and one without public IPv4. */
+const CLUSTER_RESOURCES = {
+  resources: {
+    "cl-a": {
+      availableConfigurations: [
+        { id: "cfg-a2", slug: "cpu-shared-2vcpu-4gb", name: "2 vCPU", vcpu: 2, ramGb: 4, dedicated: false },
+        { id: "cfg-a1", slug: "cpu-shared-1vcpu-2gb", name: "1 vCPU", vcpu: 1, ramGb: 2, dedicated: false },
+        { id: "cfg-ad", slug: "cpu-dedicated-1vcpu-2gb", name: "dedicated", vcpu: 1, ramGb: 2, dedicated: true },
+      ],
+      availablePublicIps: { V4: 3 },
+      availableStorage: { amd: [{ storageType: "NVME", replicated: false, volumeGb: 500 }] },
+    },
+    "cl-b": {
+      availableConfigurations: [{ id: "cfg-b1", slug: "cpu-shared-1vcpu-2gb", vcpu: 1, ramGb: 2, dedicated: false }],
+      availablePublicIps: { V4: 5 },
+      availableStorage: { amd: [{ storageType: "NVME", replicated: false, volumeGb: 500 }] },
+    },
+    "cl-noip": {
+      availableConfigurations: [{ id: "cfg-c1", slug: "cpu-shared-1vcpu-1gb", vcpu: 1, ramGb: 1, dedicated: false }],
+      availablePublicIps: { V4: 0 },
+      availableStorage: { amd: [{ storageType: "NVME", replicated: false, volumeGb: 500 }] },
+    },
+  },
+};
+
+/** GET /v1/prices/vm?clusterId=… */
+const VM_PRICES: Record<string, { items: any[] }> = {
+  "cl-a": {
+    items: [
+      { vmTypeId: { vmConfigurationId: "cfg-a2", clusterId: "cl-a" }, priceInfo: { pricePerHourPerQty: "0.02" } },
+      { vmTypeId: { vmConfigurationId: "cfg-a1", clusterId: "cl-a" }, priceInfo: { pricePerHourPerQty: "0.012" } },
+    ],
+  },
+  "cl-b": {
+    items: [{ vmTypeId: { vmConfigurationId: "cfg-b1", clusterId: "cl-b" }, priceInfo: { pricePerHourPerQty: "0.01" } }],
+  },
+  "cl-noip": {
+    items: [{ vmTypeId: { vmConfigurationId: "cfg-c1", clusterId: "cl-noip" }, priceInfo: { pricePerHourPerQty: "0.001" } }],
+  },
+};
+
+/** GET /v1/storages/default_images */
+const DEFAULT_IMAGES = {
+  items: [
+    { id: "i1", name: "Debian 12", distribution: "debian", slug: "debian-12", downloadUrl: "https://img.example/debian.qcow2", username: "debian" },
+    { id: "i2", name: "Ubuntu 22.04", distribution: "ubuntu", slug: "ubuntu-22-04", downloadUrl: "https://img.example/u2204.qcow2", username: "ubuntu" },
+    { id: "i3", name: "Ubuntu 24.04", distribution: "ubuntu", slug: "ubuntu-24-04", downloadUrl: "https://img.example/u2404.qcow2", username: "ubuntu" },
+  ],
+};
+
+/** UserVmDto: `bootDisk` and `publicIp` are id strings; the address is under `expanded`. */
+function vmDto(status: string, extra: Record<string, unknown> = {}) {
+  return {
+    id: "vm-1",
+    name: "svc",
+    status,
+    bootDisk: "disk-1",
+    publicIp: "ip-1",
+    configurationSlug: "cpu-shared-1vcpu-2gb",
+    priceHourlyUsd: "0.0104",
+    priceMonthlyUsd: "7.50",
+    createdAt: "2026-10-09T09:00:00Z",
+    ...extra,
+  };
+}
 
 describe("fluence VM client", () => {
   let db: AutomatonDatabase;
@@ -434,24 +634,30 @@ describe("fluence VM client", () => {
   });
   afterEach(() => db.close());
 
-  function api(opts: { vms?: any[]; quoteUsd?: number } = {}) {
+  function api(opts: { vms?: any[]; quote?: string; vmStatuses?: string[]; sshKey409?: boolean; sshKeys?: any } = {}) {
     const calls: { method: string; path: string; body?: any }[] = [];
+    const statuses = [...(opts.vmStatuses ?? ["launched"])];
     const apiJson = vi.fn(async (p: string, init: RequestInit = {}) => {
       const method = init.method || "GET";
       const body = init.body ? JSON.parse(String(init.body)) : undefined;
       calls.push({ method, path: p, body });
-      if (p.startsWith("/v2/vms?expand=publicIp")) return opts.vms ?? [];
-      if (p === "/v2/vms/configurations")
-        return [
-          { slug: "cpu-shared-2-ram-4gb", price: 0.02 },
-          { slug: "cpu-shared-1-ram-2gb", price: 0.01 },
-          { slug: "cpu-4-ram-8gb", price: 0.001 },
-        ];
-      if (p === "/v2/vms/default_images") return [{ name: "Debian 12", url: "debian" }, { name: "Ubuntu 24.04", url: "ubuntu-24.04" }];
-      if (p === "/v1/prices/cost") return { totalUsd: opts.quoteUsd ?? 7.5 };
-      if (p === "/v1/ssh_keys") return { id: "key-1" };
-      if (p === "/v2/vms" && method === "POST")
-        return { id: "vm-1", status: "launching", publicIp: { id: "ip-1", address: "203.0.113.5" }, bootDisk: { id: "disk-1" } };
+      if (method === "GET" && p === "/v2/vms?expand=publicIp")
+        return { items: opts.vms ?? [], pagination: { total: (opts.vms ?? []).length } };
+      if (method === "GET" && p === "/v1/clusters/resources") return CLUSTER_RESOURCES;
+      if (method === "GET" && p.startsWith("/v1/prices/vm?clusterId=")) return VM_PRICES[p.split("=")[1]] ?? { items: [] };
+      if (method === "GET" && p === "/v1/storages/default_images") return DEFAULT_IMAGES;
+      if (method === "POST" && p === "/v1/prices/cost")
+        return { costOfResources: [], totalCostPerSec: "0.0000029", periodSecs: 2592000, totalCost: opts.quote ?? "7.50" };
+      if (method === "POST" && p === "/v1/ssh_keys") {
+        if (opts.sshKey409) throw Object.assign(new Error("Fluence POST /v1/ssh_keys failed (409)"), { status: 409 });
+        return { id: "key-1", name: body.name, publicKey: body.publicKey, algorithm: "ssh-ed25519", fingerprint: "SHA256:x" };
+      }
+      if (method === "GET" && p === "/v1/ssh_keys") return opts.sshKeys ?? [];
+      if (method === "POST" && p === "/v2/vms") return vmDto("new");
+      if (method === "GET" && p === "/v2/vms/vm-1?expand=publicIp") {
+        const status = statuses.length > 1 ? statuses.shift()! : statuses[0];
+        return vmDto(status, status === "launched" ? { expanded: { publicIp: { id: "ip-1", address: "203.0.113.5" } } } : {});
+      }
       if (method === "POST" && p.endsWith("/terminate")) return {};
       if (method === "DELETE") return undefined;
       throw new Error(`unexpected ${method} ${p}`);
@@ -459,44 +665,120 @@ describe("fluence VM client", () => {
     return { apiJson, calls };
   }
 
-  function client(a: ReturnType<typeof api>, policy: TreasuryPolicy = POLICY) {
+  function client(
+    a: ReturnType<typeof api>,
+    policy: TreasuryPolicy = POLICY,
+    config = resolveFluenceConfig({ fluence: { enabled: true } }),
+  ) {
     return new FluenceVmClient({
       auth: { apiJson: a.apiJson as any },
       db: db.raw,
       policy,
-      config: resolveFluenceConfig({ fluence: { enabled: true } }),
-      ssh: { ensureKey: async () => "ssh-ed25519 AAAATEST automaton-fluence", forgetHost: vi.fn() },
+      config,
+      ssh: { ensureKey: async () => PUB_KEY, forgetHost: vi.fn() },
+      pollIntervalMs: 0,
+      launchPollAttempts: 5,
+      terminatePollAttempts: 3,
     });
   }
 
-  it("creates the cheapest cpu-shared VM with an Ubuntu disk, IPv4 and the agent's SSH key", async () => {
-    const a = api();
-    const info = await client(a).createSandbox({ name: "svc" });
+  it("creates the cheapest cpu-shared VM with the exact Fluence request shapes", async () => {
+    const a = api({ vmStatuses: ["new", "launching", "launched"] });
+    const c = client(a);
+    const info = await c.createSandbox({ name: "My Service_v2!!" });
     expect(info.id).toBe("vm-1");
-    const create = a.calls.find((c) => c.method === "POST" && c.path === "/v2/vms")!;
-    expect(create.body.configuration).toBe("cpu-shared-1-ram-2gb");
-    expect(create.body.bootDisk).toEqual({ osImage: "ubuntu-24.04", sizeGb: 25 });
-    expect(create.body.publicIp).toEqual({ version: "V4" });
-    expect(create.body.sshKeys).toEqual([{ id: "key-1" }]);
-    const keyCall = a.calls.find((c) => c.path === "/v1/ssh_keys")!;
-    expect(keyCall.body.publicKey).toMatch(/^ssh-ed25519 /);
-    // Quote covers VM + disk + IP over 30 days, before creation.
-    const quote = a.calls.find((c) => c.path === "/v1/prices/cost")!;
-    expect(quote.body.durationHours).toBe(720);
-    expect(quote.body.resources.map((r: any) => r.type)).toEqual(["vm", "storage", "public_ip"]);
+    expect(info.status).toBe("launched");
+    expect(info.terminalUrl).toBe("ssh ubuntu@203.0.113.5");
+
+    // Prices are read per candidate cluster (not the one without public IPs).
+    const prices = a.calls.filter((x) => x.path.startsWith("/v1/prices/vm"));
+    expect(prices.map((x) => x.path).sort()).toEqual(["/v1/prices/vm?clusterId=cl-a", "/v1/prices/vm?clusterId=cl-b"]);
+
+    // Cheapest priced pair: cl-b / cfg-b1 at $0.01/h.
+    const quote = a.calls.find((x) => x.path === "/v1/prices/cost")!;
+    expect(quote.body).toEqual({
+      secs: 2592000,
+      resources: [
+        { vm: { resource_id: { vmConfigurationId: "cfg-b1", clusterId: "cl-b" } } },
+        { storage: { resource_id: { storageType: "NVME", replicated: false, clusterId: "cl-b" }, volume_gb: 25 } },
+        { publicIp: { resource_id: { addressType: "V4", clusterId: "cl-b" } } },
+      ],
+    });
+
+    const keyCall = a.calls.find((x) => x.method === "POST" && x.path === "/v1/ssh_keys")!;
+    expect(keyCall.body).toEqual({ name: "automaton-fluence", publicKey: PUB_KEY });
+
+    const create = a.calls.find((x) => x.method === "POST" && x.path === "/v2/vms")!;
+    const name = create.body.name;
+    expect(name).toBe("my-service-v2");
+    expect(create.body).toEqual({
+      name,
+      clusterId: "cl-b",
+      configurationId: "cfg-b1",
+      bootDisk: {
+        clusterId: "cl-b",
+        name: `${name}-boot`,
+        storageType: "NVME",
+        volumeGb: 25,
+        replicated: false,
+        osImage: "https://img.example/u2404.qcow2",
+      },
+      publicIp: { clusterId: "cl-b", name: `${name}-ip`, addressType: "V4" },
+      sshKeys: ["key-1"],
+    });
+    for (const n of [name, create.body.bootDisk.name, create.body.publicIp.name]) expect(n).toMatch(/^[a-z0-9-]{1,25}$/);
     expect(a.calls.indexOf(quote)).toBeLessThan(a.calls.indexOf(create));
+
+    // bootDisk / publicIp ids (plain strings) and the image's SSH user are stored.
+    const row = c.getTrackedVm("vm-1")!;
+    expect([row.storage_id, row.public_ip_id, row.public_ip, row.ssh_user, row.status]).toEqual([
+      "disk-1",
+      "ip-1",
+      "203.0.113.5",
+      "ubuntu",
+      "launched",
+    ]);
+    expect(await c.getSshTarget("vm-1")).toEqual({ vmId: "vm-1", host: "203.0.113.5", user: "ubuntu" });
   });
 
-  it("refuses creation when the 30-day quote exceeds maxComputeMonthlyCents", async () => {
-    const a = api({ quoteUsd: 10.01 });
-    await expect(client(a).createSandbox()).rejects.toThrow(FluenceGuardError);
-    expect(a.calls.some((c) => c.path === "/v2/vms" && c.method === "POST")).toBe(false);
+  it("reuses the registered SSH key on 409 (matched by public key or fingerprint)", async () => {
+    const sameKeyOtherComment = `${PUB_KEY.split(" ").slice(0, 2).join(" ")} other-comment`;
+    const a = api({
+      sshKey409: true,
+      sshKeys: [
+        { id: "other", publicKey: "ssh-ed25519 AAAAOTHER x" },
+        { id: "key-7", publicKey: sameKeyOtherComment },
+      ],
+    });
+    await client(a).createSandbox();
+    expect(a.calls.find((x) => x.method === "POST" && x.path === "/v2/vms")!.body.sshKeys).toEqual(["key-7"]);
+
+    const byFingerprint = api({ sshKey409: true, sshKeys: { items: [{ id: "key-8", fingerprint: sshFingerprint(PUB_KEY) }] } });
+    expect(await client(byFingerprint).ensureSshKeyId(PUB_KEY)).toBe("key-8");
+
+    const missing = api({ sshKey409: true, sshKeys: [] });
+    await expect(client(missing).ensureSshKeyId(PUB_KEY)).rejects.toThrow(/already registered/);
+  });
+
+  it("uses the config sshUser only as an override", async () => {
+    const a = api();
+    const c = client(a, POLICY, resolveFluenceConfig({ fluence: { enabled: true, sshUser: "admin" } }));
+    await c.createSandbox();
+    expect((await c.getSshTarget("vm-1")).user).toBe("admin");
+  });
+
+  it("refuses creation when the 30-day quote exceeds maxComputeMonthlyCents or is unreadable", async () => {
+    for (const quote of ["10.01", "n/a"]) {
+      const a = api({ quote });
+      await expect(client(a).createSandbox()).rejects.toThrow(FluenceGuardError);
+      expect(a.calls.some((x) => x.path === "/v2/vms" && x.method === "POST")).toBe(false);
+    }
   });
 
   it("refuses creation when one VM already exists", async () => {
-    const a = api({ vms: [{ id: "existing", status: "active" }] });
+    const a = api({ vms: [vmDto("launched", { id: "existing" })] });
     await expect(client(a).createSandbox()).rejects.toThrow(/already exists/);
-    expect(a.calls.some((c) => c.path === "/v1/prices/cost")).toBe(false);
+    expect(a.calls.some((x) => x.path === "/v1/prices/cost")).toBe(false);
   });
 
   it("refuses creation when compute caps are absent", async () => {
@@ -505,19 +787,58 @@ describe("fluence VM client", () => {
     expect(a.calls).toHaveLength(0);
   });
 
-  it("delete terminates the VM, then deletes its public IP and its disk", async () => {
+  it("delete terminates the VM, waits for `terminated`, then deletes its public IP and its disk", async () => {
     const a = api();
     const c = client(a);
     await c.createSandbox();
     a.calls.length = 0;
+    a.apiJson.mockImplementation(async (p: string, init: RequestInit = {}) => {
+      const method = init.method || "GET";
+      a.calls.push({ method, path: p });
+      if (p === "/v2/vms/vm-1?expand=publicIp") {
+        return vmDto(a.calls.filter((x) => x.path === p).length < 2 ? "terminating" : "terminated");
+      }
+      return method === "DELETE" ? undefined : {};
+    });
     const result = await c.deleteSandbox("vm-1");
     expect(result).toEqual({ done: true, remaining: [] });
     expect(a.calls.map((x) => `${x.method} ${x.path}`)).toEqual([
       "POST /v2/vms/vm-1/terminate",
+      "GET /v2/vms/vm-1?expand=publicIp",
+      "GET /v2/vms/vm-1?expand=publicIp",
       "DELETE /v1/public_ips/ip-1",
       "DELETE /v1/storages/disk-1",
     ]);
     expect(c.getLiveTrackedVms()).toHaveLength(0);
+  });
+
+  it("leaves the IP and disk as remaining while the VM is not terminated yet, then finishes on retry", async () => {
+    const a = api();
+    const c = client(a);
+    await c.createSandbox();
+    let status = "terminating";
+    a.apiJson.mockImplementation(async (p: string, init: RequestInit = {}) => {
+      const method = init.method || "GET";
+      a.calls.push({ method, path: p });
+      if (p === "/v2/vms/vm-1?expand=publicIp") return vmDto(status);
+      return method === "DELETE" ? undefined : {};
+    });
+    a.calls.length = 0;
+    const first = await c.deleteSandbox("vm-1");
+    expect(first.done).toBe(false);
+    expect(first.remaining).toEqual([expect.stringMatching(/^public IP \(waiting/), expect.stringMatching(/^storage \(waiting/)]);
+    expect(a.calls.some((x) => x.method === "DELETE")).toBe(false);
+    // The IP / disk are still tracked as billing.
+    expect(c.getLiveTrackedVms()).toHaveLength(1);
+
+    status = "terminated";
+    a.calls.length = 0;
+    expect((await c.deleteSandbox("vm-1")).done).toBe(true);
+    expect(a.calls.map((x) => `${x.method} ${x.path}`)).toEqual([
+      "GET /v2/vms/vm-1?expand=publicIp",
+      "DELETE /v1/public_ips/ip-1",
+      "DELETE /v1/storages/disk-1",
+    ]);
   });
 
   it("retries only the remaining steps after a partial delete, and refuses unknown VMs", async () => {
@@ -527,6 +848,7 @@ describe("fluence VM client", () => {
     a.apiJson.mockImplementation(async (p: string, init: RequestInit = {}) => {
       a.calls.push({ method: init.method || "GET", path: p });
       if (p.startsWith("/v1/storages")) throw Object.assign(new Error("boom"), { status: 500 });
+      if (p === "/v2/vms/vm-1?expand=publicIp") return vmDto("terminated");
       return {};
     });
     a.calls.length = 0;
@@ -541,14 +863,102 @@ describe("fluence VM client", () => {
     await expect(c.deleteSandbox("someone-elses-vm")).rejects.toThrow(/not created by this agent/);
   });
 
-  it("parses configurations, quotes and balances leniently and fails closed", () => {
-    expect(pickCheapestSharedConfiguration(["cpu-shared-2-ram-4gb", "cpu-shared-1-ram-2gb"])?.slug).toBe("cpu-shared-1-ram-2gb");
-    expect(pickCheapestSharedConfiguration([{ slug: "cpu-2-ram-4gb" }])).toBeNull();
-    expect(parseQuoteCents({ total: "4.20" })).toBe(420);
-    expect(parseQuoteCents({ items: [{ cost: 1 }, { cost: 0.5 }] })).toBe(150);
-    expect(parseQuoteCents({ nothing: true })).toBeNull();
-    expect(parseBalanceCents({ balances: [{ currency: "USD", amount: "-2.5" }] })).toBe(-250);
-    expect(parseBalanceCents({})).toBeNull();
+  it("cleans up a VM that fails to start (terminate, IP, disk)", async () => {
+    const a = api({ vmStatuses: ["launching", "failed"] });
+    const c = client(a);
+    await expect(c.createSandbox()).rejects.toThrow(/failed to start; it was cleaned up/);
+    expect(
+      a.calls
+        .filter((x) => x.method !== "GET")
+        .map((x) => `${x.method} ${x.path}`)
+        .slice(-3),
+    ).toEqual(["POST /v2/vms/vm-1/terminate", "DELETE /v1/public_ips/ip-1", "DELETE /v1/storages/disk-1"]);
+    expect(c.getLiveTrackedVms()).toHaveLength(0);
+  });
+
+  it("a tracked VM reported `failed` is cleaned up before a new one is planned", async () => {
+    const a = api();
+    const c = client(a);
+    await c.createSandbox();
+    a.calls.length = 0;
+    a.apiJson.mockImplementation(async (p: string, init: RequestInit = {}) => {
+      const method = init.method || "GET";
+      a.calls.push({ method, path: p });
+      if (p === "/v2/vms?expand=publicIp") {
+        const terminated = a.calls.some((x) => x.path.endsWith("/terminate"));
+        return { items: terminated ? [] : [vmDto("failed")], pagination: {} };
+      }
+      if (p === "/v2/vms/vm-1?expand=publicIp") return vmDto("failed");
+      if (p === "/v1/clusters/resources") return { resources: {} };
+      return method === "DELETE" ? undefined : {};
+    });
+    await expect(c.createSandbox()).rejects.toThrow(/No priced cpu-shared/);
+    expect(a.calls.map((x) => `${x.method} ${x.path}`)).toEqual(
+      expect.arrayContaining(["POST /v2/vms/vm-1/terminate", "DELETE /v1/public_ips/ip-1", "DELETE /v1/storages/disk-1"]),
+    );
+    expect(c.getLiveTrackedVms()).toHaveLength(0);
+  });
+
+  it("never passes a non-IPv4 address to ssh", async () => {
+    const a = api({ vmStatuses: ["new"] });
+    const c = client(a);
+    await c.createSandbox();
+    a.apiJson.mockImplementation(async (p: string) =>
+      p === "/v2/vms/vm-1?expand=publicIp"
+        ? vmDto("launched", { expanded: { publicIp: { address: "-oProxyCommand=sh" } } })
+        : {},
+    );
+    await expect(c.getSshTarget("vm-1")).rejects.toThrow(/no valid public IPv4/);
+    expect(mapVm(vmDto("launched", { expanded: { publicIp: { address: "1.2.3.4; id" } } }))?.address).toBeUndefined();
+    expect(mapVm(vmDto("launched", { expanded: { publicIp: { address: "999.1.1.1" } } }))?.address).toBeUndefined();
+    expect(mapVm(vmDto("launched", { expanded: { publicIp: { address: "198.51.100.7" } } }))?.address).toBe("198.51.100.7");
+  });
+
+  it("parses the documented shapes and fails closed on anything else", () => {
+    expect(
+      sharedCandidates(CLUSTER_RESOURCES, 25)
+        .map((x) => `${x.clusterId}/${x.id}`)
+        .sort(),
+    ).toEqual(["cl-a/cfg-a1", "cl-a/cfg-a2", "cl-b/cfg-b1"]);
+    // Not enough NVME, or only replicated storage: no candidate.
+    expect(sharedCandidates(CLUSTER_RESOURCES, 600)).toEqual([]);
+    const replicatedOnly = {
+      resources: {
+        x: {
+          ...CLUSTER_RESOURCES.resources["cl-a"],
+          availableStorage: { amd: [{ storageType: "NVME", replicated: true, volumeGb: 500 }] },
+        },
+      },
+    };
+    expect(sharedCandidates(replicatedOnly, 25)).toEqual([]);
+    expect(sharedCandidates([{ slug: "cpu-shared-1vcpu-1gb" }], 25)).toEqual([]);
+    expect(vmHourlyPrice(VM_PRICES["cl-a"], "cl-a", "cfg-a1")).toBe(0.012);
+    expect(vmHourlyPrice(VM_PRICES["cl-a"], "cl-b", "cfg-a1")).toBeUndefined();
+
+    expect(parseQuoteCents({ costOfResources: [], totalCostPerSec: "0.0000016", periodSecs: 2592000, totalCost: "4.20" })).toBe(420);
+    expect(parseQuoteCents({ totalCost: 4.2 })).toBeNull();
+    expect(parseQuoteCents({ total: "4.20" })).toBeNull();
+
+    expect(parseBalance([{ balance: "-2.5", usageDaysLeft: null }])).toEqual({ cents: -250, usageDaysLeft: null });
+    expect(parseBalance([{ balance: "10" }, { balance: "2.25", usageDaysLeft: 4 }])).toEqual({ cents: 1225, usageDaysLeft: 4 });
+    expect(parseBalance({ balance: "10" })).toBeNull();
+    expect(parseBalance([{ balance: 10 }])).toBeNull();
+    expect(parseBalance([])).toBeNull();
+
+    expect(pickUbuntuImage(DEFAULT_IMAGES)).toEqual({
+      downloadUrl: "https://img.example/u2404.qcow2",
+      username: "ubuntu",
+      name: "Ubuntu 24.04",
+    });
+    expect(pickUbuntuImage({ items: [DEFAULT_IMAGES.items[0], DEFAULT_IMAGES.items[1]] })?.downloadUrl).toBe(
+      "https://img.example/u2204.qcow2",
+    );
+    expect(pickUbuntuImage({ items: [DEFAULT_IMAGES.items[0]] })).toBeNull();
+    expect(pickUbuntuImage(DEFAULT_IMAGES.items)).toBeNull();
+
+    expect(sanitizeFluenceName("A".repeat(60))).toBe("a".repeat(20));
+    expect(sanitizeFluenceName("---")).toBe("automaton-service");
+    expect(mapVm({ id: "x" })).toBeNull();
   });
 });
 
@@ -608,6 +1018,13 @@ describe("fluence SSH", () => {
     const { t } = transport();
     const ssh = new FluenceSsh({ transport: t, sshDir: path.join(dir, "ssh") });
     await expect(ssh.exec({ vmId: "v", host: "a;rm -rf /", user: "ubuntu" }, "ls")).rejects.toThrow(/Invalid VM host/);
+    // Only a plain IPv4 reaches ssh / scp / ssh-keyscan.
+    for (const host of ["vm.example.com", "::1", "-oProxyCommand=id", "256.1.1.1", "1.2.3"]) {
+      expect(isValidHost(host), host).toBe(false);
+      await expect(ssh.exec({ vmId: "v", host, user: "ubuntu" }, "ls")).rejects.toThrow(/Invalid VM host/);
+    }
+    expect(isValidHost("203.0.113.5")).toBe(true);
+    await expect(ssh.exec({ vmId: "v", host: "203.0.113.5", user: "-oX" }, "ls")).rejects.toThrow(/Invalid VM user/);
     expect(isSafeRemotePath("~/service/server.js")).toBe(true);
     expect(isSafeRemotePath("~/a b")).toBe(false);
     expect(isSafeRemotePath("../etc/passwd")).toBe(false);
@@ -729,6 +1146,12 @@ describe("fluence tools and policies", () => {
     const tools = createBuiltinTools("sb");
     expect(tools.find((t) => t.name === "fluence_topup")?.riskLevel).toBe("dangerous");
     expect(tools.find((t) => t.name === "fluence_status")?.description).toMatch(/debt exceeds \$5 or lasts 3 days/);
+    for (const name of ["create_sandbox", "fluence_status", "fluence_topup"]) {
+      const d = tools.find((t) => t.name === name)!.description;
+      expect(d, name).toMatch(/per second/);
+      expect(d, name).toMatch(/at least 6 hours/);
+      expect(d, name).toMatch(/billed separately/);
+    }
     const forbidden = createDefaultRules().find((r) => r.id === "command.forbidden_patterns")!;
     expect((forbidden.appliesTo as any).names).toContain("sandbox_exec");
   });
@@ -778,13 +1201,13 @@ describe("fluence balance awareness", () => {
   });
   afterEach(() => db.close());
 
-  function runtime(balanceCents: number, burnPerHour: number | null) {
+  function runtime(balanceCents: number, burnPerHour: number | null, usageDaysLeft: number | null = null) {
     const topUp = vi.fn();
     const precheck = vi.fn((_amount: number) => null as string | null);
     return {
       rt: {
         vms: {
-          getBalanceCents: async () => balanceCents,
+          getBalance: async () => ({ cents: balanceCents, usageDaysLeft }),
           getHourlyBurnCents: () => burnPerHour,
           getLiveTrackedVms: () => [{ vm_terminated: 0 }],
         } as any,
@@ -820,6 +1243,15 @@ describe("fluence balance awareness", () => {
     refused.precheck.mockReturnValue("Monthly compute cap exceeded");
     const msg = await checkComputeBalance(refused.rt, db2, () => Date.UTC(2026, 9, 9));
     expect(msg.message).toMatch(/not possible within the caps/);
+    db2.close();
+  });
+
+  it("uses Fluence's usageDaysLeft as the runway when present", async () => {
+    const short = await checkComputeBalance(runtime(10_000, 1, 0.5).rt, db, () => Date.UTC(2026, 9, 9));
+    expect(short.shouldWake).toBe(true);
+    expect(short.message).toMatch(/runway is 0\.5 days/);
+    const db2 = createTestDb();
+    expect((await checkComputeBalance(runtime(100, 10, 10).rt, db2)).shouldWake).toBe(false);
     db2.close();
   });
 
