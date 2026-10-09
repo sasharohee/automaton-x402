@@ -138,7 +138,7 @@ export function buildContextMessages(
       const tools = t.toolCalls
         .map((tc) => `${tc.name}(${tc.error ? "FAILED" : "ok"})`)
         .join(", ");
-      return `[${t.timestamp}] ${t.inputSource || "self"}: ${t.thinking.slice(0, 100)}${tools ? ` | tools: ${tools}` : ""}`;
+      return `[${t.timestamp}] ${t.inputSource || "self"}: ${(t.thinking || "").slice(0, 100)}${tools ? ` | tools: ${tools}` : ""}`;
     });
     summaryMessage = `Previous context summary (${oldTurns.length} turns compressed):\n${oldSummaries.join("\n")}`;
   } else {
@@ -163,11 +163,13 @@ export function buildContextMessages(
       });
     }
 
-    // The agent's thinking as assistant message
-    if (turn.thinking) {
+    // The agent's thinking as assistant message. Models often answer with
+    // tool calls and no text: those turns must stay in the context too, or
+    // the model never sees its own previous calls and results.
+    if (turn.thinking || turn.toolCalls.length > 0) {
       const msg: ChatMessage = {
         role: "assistant",
-        content: turn.thinking,
+        content: turn.thinking || "",
       };
 
       // If there were tool calls, include them
@@ -311,7 +313,7 @@ export async function summarizeTurns(
     const tools = t.toolCalls
       .map((tc) => `${tc.name}(${tc.error ? "FAILED" : "ok"})`)
       .join(", ");
-    return `[${t.timestamp}] ${t.inputSource || "self"}: ${t.thinking.slice(0, 100)}${tools ? ` | tools: ${tools}` : ""}`;
+    return `[${t.timestamp}] ${t.inputSource || "self"}: ${(t.thinking || "").slice(0, 100)}${tools ? ` | tools: ${tools}` : ""}`;
   });
 
   // If few enough turns, just return the summaries directly

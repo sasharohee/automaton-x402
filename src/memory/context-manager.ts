@@ -405,10 +405,11 @@ export class ContextManager {
         });
       }
 
-      if (typeof turn?.thinking === "string" && turn.thinking.length > 0) {
+      const hasThinking = typeof turn?.thinking === "string" && turn.thinking.length > 0;
+      if (hasThinking || (Array.isArray(turn?.toolCalls) && turn.toolCalls.length > 0)) {
         const assistantMessage: ChatMessage = {
           role: "assistant",
-          content: turn.thinking,
+          content: hasThinking ? turn.thinking : "",
         };
 
         if (Array.isArray(turn.toolCalls) && turn.toolCalls.length > 0) {
