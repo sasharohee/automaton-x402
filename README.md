@@ -160,22 +160,6 @@ Other safeguards:
 - **Writable directory.** In standalone mode `write_file` and local workers can only write under `~/work` (created at startup). `~/.automaton`, the rest of `HOME` and the application directory are refused. Conway mode keeps `/root`.
 - **No inbound connectivity.** The system prompt tells the agent that servers it starts are only reachable from localhost, that it has no ETH for gas, and that it should earn only through outbound requests.
 
-### Public service (optional)
-
-If the operator publishes one local port of the container at a public HTTPS URL (for example with a separate ngrok tunnel sharing the container's network), declare it in `automaton.json`:
-
-```json
-{
-  "providerMode": "standalone",
-  "publicService": { "publicUrl": "https://example.ngrok-free.app", "servicePort": 8787 }
-}
-```
-
-- Read only in standalone mode. `publicUrl` must be `https://`; `servicePort` defaults to 8787 and must be in 1024-65535. An invalid block is ignored with a warning, and the agent then stays in "no inbound connectivity" mode.
-- The parent, worker, planner and replanner prompts then say that a server listening on `0.0.0.0:<servicePort>` is public at `<publicUrl>` (the only exposed port). They also tell the agent to sell its work behind an x402 v2 paywall (`@x402/express` + `@x402/evm`, `exact`, `eip155:8453`, Base USDC, `payTo` = its own address, facilitator `https://facilitator.payai.network`). The paywall must run before any inference, and the server must never read `~/.automaton` or the wallet key. The code goes in `~/work/<service>`, and the agent must restart the server after every restart of the agent process.
-- Each parent prompt reports whether `127.0.0.1:<servicePort>` answers. This is a local TCP connection with a 500 ms timeout and uses no inference.
-- The agent never sees the tunnel or its token. No guardrail changes: `x402AllowedDomains` stays `blockrun.ai`, because the facilitator is not paid in x402. `expose_port` stays disabled, writes stay confined to `~/work`, and all caps and the reserve are unchanged.
-
 ### Fluence VM (optional)
 
 The agent can rent **one** small [Fluence CPU Cloud](https://fluence.dev/docs/build/api/cpu_cloud) VM that hosts **only its public x402 service**. The VM never receives the wallet, `wallet.json`, `~/.automaton`, a private key or an API key: the service only needs the `payTo` address. There is no replication and no agent runtime on the VM.
@@ -207,6 +191,22 @@ The agent can rent **one** small [Fluence CPU Cloud](https://fluence.dev/docs/bu
 - **SSH.** `sandbox_exec` and `sandbox_upload` use a dedicated ed25519 key in `~/.automaton/ssh/` (never shown to the model). The host key is pinned on first connect, then `StrictHostKeyChecking=yes`, `BatchMode=yes`, no agent or X11 forwarding. `ssh`/`scp` run through `execFile` (no local shell). `sandbox_upload` only accepts real paths under `~/work`. It refuses `~/.automaton`, `/proc`, `wallet*.json`, `*.key`, `*.pem`, `.env*`, symlinks leaving `~/work` (those inside `node_modules` are skipped) and any file that looks like a private key.
 - **Balance.** The `check_compute_balance` heartbeat task (every 30 min, no-op unless Fluence is enabled) reads the Fluence balance and the hourly burn. If the runway is under 3 days it wakes the agent with a `[COMPUTE]` message. Under 1 day, the message says whether a top-up fits the caps and the reserve; only the agent's own `fluence_topup` call can pay. The balance and runway are shown in the prompt status block. Fluence terminates VMs when the debt exceeds $5 or lasts 3 days.
 - **Unchanged.** `spawn_child`, `fund_child`, `start_child`, `transfer_credits`, `topup_credits`, the domain tools and `expose_port` / `remove_port` stay disabled. `fluence.json` and `ssh/` are never committed to the state repo, `exec` / `read_file` / `sandbox_upload` are denied on `~/.automaton`, and the Fluence modules are in `PROTECTED_FILES`.
+
+### Public service (optional)
+
+If the operator publishes one local port of the container at a public HTTPS URL (for example with a separate ngrok tunnel sharing the container's network), declare it in `automaton.json`:
+
+```json
+{
+  "providerMode": "standalone",
+  "publicService": { "publicUrl": "https://example.ngrok-free.app", "servicePort": 8787 }
+}
+```
+
+- Read only in standalone mode. `publicUrl` must be `https://`; `servicePort` defaults to 8787 and must be in 1024-65535. An invalid block is ignored with a warning, and the agent then stays in "no inbound connectivity" mode.
+- The parent, worker, planner and replanner prompts then say that a server listening on `0.0.0.0:<servicePort>` is public at `<publicUrl>` (the only exposed port). They also tell the agent to sell its work behind an x402 v2 paywall (`@x402/express` + `@x402/evm`, `exact`, `eip155:8453`, Base USDC, `payTo` = its own address, facilitator `https://facilitator.payai.network`). The paywall must run before any inference, and the server must never read `~/.automaton` or the wallet key. The code goes in `~/work/<service>`, and the agent must restart the server after every restart of the agent process.
+- Each parent prompt reports whether `127.0.0.1:<servicePort>` answers. This is a local TCP connection with a 500 ms timeout and uses no inference.
+- The agent never sees the tunnel or its token. No guardrail changes: `x402AllowedDomains` stays `blockrun.ai`, because the facilitator is not paid in x402. `expose_port` stays disabled, writes stay confined to `~/work`, and all caps and the reserve are unchanged.
 
 The legacy Conway mode is unchanged and remains available with `"providerMode": "conway"` (the default for existing configs).
 

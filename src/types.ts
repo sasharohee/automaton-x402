@@ -89,6 +89,11 @@ export interface AutomatonConfig {
   /** BlockRun inference settings (standalone mode). */
   blockrun?: BlockRunConfig;
   /**
+   * Standalone only: rent ONE small Fluence CPU Cloud VM to host the public
+   * x402 service (no wallet, no agent runtime on the VM). Absent = disabled.
+   */
+  fluence?: FluenceConfig;
+  /**
    * Allow the heartbeat to fetch upstream commits and wake the agent to
    * review them. Disabled by default.
    */
@@ -98,25 +103,6 @@ export interface AutomatonConfig {
    * this machine at a public HTTPS URL. Absent = no inbound connectivity.
    */
   publicService?: PublicServiceConfig;
-  /**
-   * Standalone only: rent ONE small Fluence CPU Cloud VM to host the public
-   * x402 service (no wallet, no agent runtime on the VM). Absent = disabled.
-   */
-  fluence?: FluenceConfig;
-}
-
-export interface FluenceConfig {
-  enabled: boolean;
-  /** API base URL (default https://api.fluence.dev). */
-  apiUrl?: string;
-  /** Hard limit on live Fluence VMs (default 1, never above 1). */
-  maxComputeVms?: number;
-  /** SSH user of the VM image (default "ubuntu"). */
-  sshUser?: string;
-  /** OS image for the boot disk (default: the first Ubuntu default image). */
-  osImage?: string;
-  /** Boot disk size in GB (default 25, max 50). */
-  diskGb?: number;
 }
 
 export interface PublicServiceConfig {
@@ -161,6 +147,20 @@ export interface BlockRunConfig {
   models: ModelTierMap;
   /** Escalation model for hard work. Defaults to DEFAULT_MODEL_ESCALATION. */
   escalation?: ModelEscalationConfig;
+}
+
+export interface FluenceConfig {
+  enabled: boolean;
+  /** API base URL (default https://api.fluence.dev). */
+  apiUrl?: string;
+  /** Hard limit on live Fluence VMs (default 1, never above 1). */
+  maxComputeVms?: number;
+  /** SSH user of the VM image (default "ubuntu"). */
+  sshUser?: string;
+  /** OS image for the boot disk (default: the first Ubuntu default image). */
+  osImage?: string;
+  /** Boot disk size in GB (default 25, max 50). */
+  diskGb?: number;
 }
 
 export const DEFAULT_BLOCKRUN_CONFIG: BlockRunConfig = {

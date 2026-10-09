@@ -173,6 +173,8 @@ export function loadConfig(): AutomatonConfig | null {
       chainType: raw.chainType || "evm",
       providerMode,
       blockrun,
+      // Fluence VMs: standalone only, opt-in.
+      fluence: standalone ? parseFluenceConfig(raw.fluence) : undefined,
       inferenceModel:
         standalone && blockrun
           ? blockrun.models.normal
@@ -184,8 +186,6 @@ export function loadConfig(): AutomatonConfig | null {
       autoUpdate: raw.autoUpdate === true,
       // Only meaningful (and only read) in standalone mode.
       publicService: standalone ? parsePublicServiceConfig(raw.publicService) : undefined,
-      // Fluence VMs: standalone only, opt-in.
-      fluence: standalone ? parseFluenceConfig(raw.fluence) : undefined,
     } as AutomatonConfig;
   } catch {
     return null;
