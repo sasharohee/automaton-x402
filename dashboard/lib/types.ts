@@ -116,9 +116,22 @@ export interface Snapshot {
 
 export type StateSource = "memory" | "kv" | "blob" | "none";
 
+/** Statut du service public, vérifié par le serveur du tableau de bord (pas par le pusher). */
+export interface ServiceStatus {
+  ok: boolean;
+  httpStatus: number | null;
+  latencyMs: number | null;
+  checkedAt: string;
+  /** `host:port` uniquement. */
+  target: string;
+  /** Libellé générique en français, jamais un message d'exception brut. */
+  error?: string;
+}
+
 export interface StateResponse {
   snapshot: Snapshot | null;
   receivedAt: string | null;
   serverNow: string;
   source: StateSource;
+  service?: ServiceStatus | null;
 }
